@@ -221,6 +221,80 @@ class HarnessRunStore:
         data = json.loads((self.run_dir(run_id) / "run.json").read_text(encoding="utf-8"))
         return HarnessRun(**data)
 
+    def list_runs(self) -> list[HarnessRun]:
+        runs: list[HarnessRun] = []
+        if not self.runs_root.exists():
+            return runs
+        for path in sorted(self.runs_root.glob("*/run.json")):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                runs.append(HarnessRun(**data))
+            except Exception:
+                continue
+        runs.sort(key=lambda r: r.updated_at or r.created_at, reverse=True)
+        return runs
+
+    def list_grouped_by_agent(self, pref_store: Any | None = None) -> dict[str, Any]:
+        """Return dashboard-ready harness runs grouped by agent.
+
+        Shape is intentionally simple for the dashboard harness tab:
+        agents -> default harness first, then thread summaries ordered by the
+        latest run/message timestamp, newest first.
+        """
+        def _default_harness_for(agent_name: str) -> dict[str, str]:
+            pref = None
+            if pref_store is not None:
+                key = agent_name.strip().lower().replace(" ", "-") or "default"
+                default_pref = pref_store.get("default")
+                candidate = pref_store.get(key) if key != "default" else default_pref
+                built_in_default = type(default_pref)()
+                pref = default_pref if key != "default" and candidate == built_in_default else candidate
+            return {
+                "harness": getattr(pref, "harness", ""),
+                "model": getattr(pref, "model", ""),
+                "mode": getattr(pref, "mode", ""),
+                "repo": getattr(pref, "repo", ""),
+                "workdir": getattr(pref, "workdir", ""),
+                "branch": getattr(pref, "branch", ""),
+            }
+
+        grouped: dict[str, list[HarnessRun]] = {}
+        for run in self.list_runs():
+            agent = str(run.source.get("agent") or run.source.get("profile") or run.source.get("user") or "Unassigned")
+            grouped.setdefault(agent, []).append(run)
+
+        agents = []
+        for agent, runs in grouped.items():
+            threads = []
+            for run in sorted(runs, key=lambda r: r.updated_at or r.created_at, reverse=True):
+                latest_time = run.updated_at or run.created_at
+                threads.append({
+                    "run_id": run.run_id,
+                    "task_id": run.task_id,
+                    "thread_key": run.thread_key,
+                    "harness": run.harness,
+                    "model": run.model,
+                    "mode": run.mode,
+                    "state": run.state,
+                    "latest_message_time": latest_time,
+                    "updated_at": run.updated_at,
+                    "created_at": run.created_at,
+                    "about": (run.goal or "").strip() or "Harness run",
+                    "links": run.links,
+                    "native": run.native,
+                    "repo": run.repo,
+                    "workdir": run.workdir,
+                    "branch": run.branch,
+                })
+            agents.append({
+                "agent": agent,
+                "default_harness": _default_harness_for(agent),
+                "threads": threads,
+                "latest_message_time": threads[0]["latest_message_time"] if threads else "",
+            })
+        agents.sort(key=lambda a: (a.get("latest_message_time") or ""), reverse=True)
+        return {"agents": agents}
+
     def append_event(self, run_id: str, event_type: str, payload: dict[str, Any] | None = None) -> None:
         d = self.run_dir(run_id)
         d.mkdir(parents=True, exist_ok=True)

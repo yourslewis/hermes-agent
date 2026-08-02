@@ -1,0 +1,14 @@
+{
+  "name": "harness_controller",
+  "label": "Harness",
+  "description": "External harness runs grouped by agent with default harness and latest thread summaries.",
+  "icon": "Code",
+  "version": "0.1.0",
+  "tab": {
+    "path": "/harness",
+    "position": "after:sessions"
+  },
+  "entry": "dist/index.js",
+  "css": "dist/style.css",
+  "api": "plugin_api.py"
+}

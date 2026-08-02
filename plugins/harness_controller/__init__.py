@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import shlex
 import subprocess
 from dataclasses import asdict
@@ -28,6 +29,60 @@ _store = HarnessTaskStore(Path(get_hermes_home()) / "harness_tasks")
 _run_store = HarnessRunStore(Path(get_hermes_home()) / "harness_runs")
 _pref_store = HarnessPreferenceStore(Path(get_hermes_home()) / "harness_config")
 _preferences: dict[str, dict[str, str]] = {}
+
+
+def _load_profile_config() -> dict[str, Any]:
+    config_path = Path(get_hermes_home()) / "config.yaml"
+    try:
+        import yaml
+
+        data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _auto_route_settings() -> dict[str, Any]:
+    cfg = _load_profile_config()
+    harness_cfg = cfg.get("harness") if isinstance(cfg, dict) else {}
+    if not isinstance(harness_cfg, dict):
+        return {}
+    auto_cfg = harness_cfg.get("auto_route")
+    return auto_cfg if isinstance(auto_cfg, dict) else {}
+
+
+def _auto_route_enabled_for_event(event: Any) -> bool:
+    auto_cfg = _auto_route_settings()
+    if not auto_cfg:
+        return False
+    if not bool(auto_cfg.get("enabled", False)):
+        return False
+
+    platforms = auto_cfg.get("platforms")
+    normalized: set[str] = set()
+    if isinstance(platforms, list):
+        normalized = {str(x).strip().lower() for x in platforms if str(x).strip()}
+    elif isinstance(platforms, str) and platforms.strip():
+        normalized = {platforms.strip().lower()}
+
+    if normalized:
+        source = getattr(event, "source", None)
+        platform = getattr(getattr(source, "platform", None), "value", None) or str(getattr(source, "platform", ""))
+        if platform.strip().lower() not in normalized:
+            return False
+    return True
+
+
+def _should_bypass_auto_route(text: str) -> bool:
+    if not text:
+        return True
+    # Explicit bypass for direct Hermes chat in auto-routed threads.
+    if text.startswith("!!"):
+        return True
+    # Let slash/command style messages continue through normal command routing.
+    if text.startswith("/") or text.startswith("!"):
+        return True
+    return False
 
 
 def _thread_key_from_event(event: Any) -> str:
@@ -217,11 +272,13 @@ async def _post_to_thread(gateway: Any, event: Any, text: str, blocks: list[dict
 def _source_dict_from_event(event: Any) -> dict[str, Any]:
     source = getattr(event, "source", None)
     platform = getattr(getattr(source, "platform", None), "value", None) or str(getattr(source, "platform", ""))
+    agent = (os.environ.get("HERMES_PROFILE") or "").strip()
     return {
         "platform": platform,
         "channel_id": getattr(source, "chat_id", "") or "",
         "thread_ts": getattr(source, "thread_id", None) or getattr(event, "message_id", None) or "",
         "message_id": getattr(event, "message_id", "") or "",
+        "agent": agent,
     }
 
 
@@ -332,6 +389,18 @@ def _pre_gateway_dispatch(event: Any = None, gateway: Any = None, **_: Any) -> d
         else:
             loop.create_task(_handle_answer_event(gateway, event, raw_args))
         return {"action": "skip", "reason": "harness controller handling /hanswer"}
+
+    # Optional profile-level auto-route for normal messages.
+    # When enabled, plain thread messages are treated as /hrun goals.
+    if _auto_route_enabled_for_event(event) and not _should_bypass_auto_route(text):
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            asyncio.run(_handle_run_event(gateway, event, text))
+        else:
+            loop.create_task(_handle_run_event(gateway, event, text))
+        return {"action": "skip", "reason": "harness controller auto-routed message to /hrun"}
+
     if not text.startswith("/harness"):
         return None
     # We cannot synchronously send a Slack button card from this hook; let the

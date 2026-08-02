@@ -252,6 +252,26 @@ def test_slack_plan_blocks_include_action_tokens():
         assert element["value"] == task.task_id
 
 
+def test_slack_plan_blocks_keep_each_section_under_slack_limit_for_long_codex_output():
+    from plugins.harness_controller.controller import HarnessController
+    from plugins.harness_controller.slack_blocks import build_plan_blocks
+
+    controller = HarnessController.in_memory()
+    task = controller.create_task("slack:C1:123.4", "codex", "gpt-5.6-sol", "Fix it " + "very-long-scope " * 180)
+    controller.attach_plan(task.task_id, plan_text="Codex plan line.\n" * 500, auto_prompt="Run it")
+    task.canvas_url = "https://canvas.wenhao.dev/harness?run=hrun_test&tab=codex"
+    task.remote_cli_url = "https://canvas.wenhao.dev/ui/codex-cli/"
+    task.vscode_url = "https://canvas.wenhao.dev/ui/vscode/?folder=%2Fvery%2Flong%2Frepo"
+
+    blocks = build_plan_blocks(task)
+    section_texts = [block["text"]["text"] for block in blocks if block.get("type") == "section"]
+
+    assert len(section_texts) > 1
+    assert all(len(text) <= 3000 for text in section_texts)
+    assert any("Codex plan line." in text for text in section_texts)
+    assert blocks[-1]["type"] == "actions"
+
+
 def test_slack_approve_callback_acks_and_launches_auto():
     from plugins.harness_controller.controller import HarnessController
     from plugins.harness_controller.slack_actions import handle_approve_auto
