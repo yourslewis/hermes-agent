@@ -53,7 +53,28 @@ def test_harness_run_tool_creates_run_record_with_canvas_url_without_executing(t
     assert result["run"]["workdir"] == "/repo"
     assert result["run"]["branch"] == "main"
     assert result["run"]["links"]["canvas"].startswith("https://canvas.wenhao.dev/harness?run=hrun_")
+    assert result["run"]["links"]["remote_cli"] == "https://canvas.wenhao.dev/ui/opencode-cli/"
+    assert result["run"]["links"]["vscode"].startswith("https://canvas.wenhao.dev/ui/vscode/")
     assert "opencode" in result["command"][0]
+
+
+def test_harness_run_tool_with_hermes_default_does_not_spawn_external_command(tmp_path, monkeypatch):
+    import plugins.harness_controller as hc
+    from plugins.harness_controller.preferences import HarnessPreference, HarnessPreferenceStore
+    from plugins.harness_controller.run_registry import HarnessRunStore
+
+    pref_store = HarnessPreferenceStore(tmp_path / "cfg")
+    pref_store.set("default", HarnessPreference(harness="hermes", model="gpt-5.6-sol", mode="plan"))
+    monkeypatch.setattr(hc, "_pref_store", pref_store)
+    monkeypatch.setattr(hc, "_run_store", HarnessRunStore(tmp_path / "runs"))
+    monkeypatch.setattr(hc, "_preferences", {})
+
+    result = json.loads(hc._tool_harness_run({"goal": "Smoke plan"}))
+
+    assert result["success"] is True
+    assert result["run"]["harness"] == "hermes"
+    assert result["command"] == []
+    assert "No external worker command" in result["output"]
 
 
 def test_harness_controller_registers_harness_toolset_tools(tmp_path, monkeypatch):

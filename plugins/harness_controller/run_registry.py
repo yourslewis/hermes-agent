@@ -4,6 +4,7 @@ import json
 import re
 import uuid
 from dataclasses import asdict, dataclass, field
+from urllib.parse import quote
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -45,6 +46,8 @@ class HarnessRun:
 
 def normalize_harness(harness: str) -> str:
     h = (harness or "").strip().lower().replace("_", "-")
+    if h in {"hermes", "self"}:
+        return "hermes"
     if h == "claude":
         return "claude-code"
     return h
@@ -53,6 +56,23 @@ def normalize_harness(harness: str) -> str:
 def canvas_url(run_id: str, harness: str) -> str:
     tab = normalize_harness(harness)
     return f"{CANVAS_ORIGIN}/harness?run={run_id}&tab={tab}"
+
+
+def remote_cli_url(harness: str) -> str:
+    h = normalize_harness(harness)
+    routes = {
+        "claude-code": "claude-code-cli",
+        "codex": "codex-cli",
+        "opencode": "opencode-cli",
+    }
+    route = routes.get(h)
+    return f"{CANVAS_ORIGIN}/ui/{route}/" if route else ""
+
+
+def vscode_url(workdir: str) -> str:
+    if not workdir:
+        return f"{CANVAS_ORIGIN}/ui/vscode/"
+    return f"{CANVAS_ORIGIN}/ui/vscode/?folder={quote(workdir, safe='')}"
 
 
 def _cd_prefix(workdir: str) -> str:
@@ -69,6 +89,8 @@ def resume_command(harness: str, session_id: str | None, workdir: str = "") -> s
         return f"{prefix}opencode -s {sid}"
     if h == "codex":
         return f"{prefix}codex resume {sid}"
+    if h == "hermes":
+        return f"{prefix}hermes chat -q '<handoff prompt>'"
     if h == "copilot":
         return f"{prefix}copilot -p '<handoff prompt>' --model <model>"
     return f"{prefix}{h} resume {sid}"
@@ -84,6 +106,8 @@ def fork_command(harness: str, session_id: str | None, workdir: str = "") -> str
         return f"{prefix}opencode -s {sid} --fork"
     if h == "codex":
         return f"{prefix}codex fork {sid}"
+    if h == "hermes":
+        return f"{prefix}hermes chat -q '<fork handoff prompt>'"
     return ""
 
 
@@ -160,7 +184,11 @@ class HarnessRunStore:
             "resume": resume_command(h, None, workdir or ""),
             "fork": fork_command(h, None, workdir or ""),
         }
-        links = {"canvas": canvas_url(run_id, h)}
+        links = {
+            "canvas": canvas_url(run_id, h),
+            "remote_cli": remote_cli_url(h),
+            "vscode": vscode_url(workdir or ""),
+        }
         run = HarnessRun(
             run_id=run_id,
             task_id=task_id,

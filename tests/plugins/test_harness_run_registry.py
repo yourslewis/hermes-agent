@@ -18,6 +18,9 @@ def test_harness_run_store_creates_canvas_url_and_resume_commands(tmp_path):
 
     assert run.run_id.startswith("hrun_")
     assert run.links["canvas"] == f"https://canvas.wenhao.dev/harness?run={run.run_id}&tab=claude-code"
+    assert run.links["remote_cli"] == "https://canvas.wenhao.dev/ui/claude-code-cli/"
+    assert run.links["vscode"].startswith("https://canvas.wenhao.dev/ui/vscode/")
+    assert "folder=%2Frepo" in run.links["vscode"]
     assert run.commands["resume"] == "cd /repo && claude --resume <session_id>"
     assert (tmp_path / "runs" / run.run_id / "run.json").exists()
 
@@ -72,8 +75,14 @@ def test_slack_plan_blocks_include_canvas_link(tmp_path):
     )
     task.run_id = run.run_id
     task.canvas_url = run.links["canvas"]
+    task.remote_cli_url = run.links["remote_cli"]
+    task.vscode_url = run.links["vscode"]
 
     text = build_plan_blocks(task)[0]["text"]["text"]
 
     assert "Open in Canvas" in text
+    assert "Remote CLI" in text
+    assert "VS Code" in text
     assert "https://canvas.wenhao.dev/harness?run=" in text
+    assert "https://canvas.wenhao.dev/ui/opencode-cli/" in text
+    assert "https://canvas.wenhao.dev/ui/vscode/" in text

@@ -166,12 +166,18 @@ def _tool_harness_run(args: dict | None = None, **_: Any) -> str:
     )
     if bool(args.get("dry_run", False)):
         return json.dumps({"success": True, "run": asdict(run), "command": spec.argv, "dry_run": True})
+    if not spec.argv:
+        output = "Hermes is the active/default harness for this profile. No external worker command was launched."
+        updated = _run_store.record_result(run.run_id, exit_code=0, output=output)
+        return json.dumps({"success": True, "run": asdict(updated), "command": spec.argv, "output": output})
     proc = subprocess.run(spec.argv, cwd=spec.cwd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=int(args.get("timeout") or 600))
     updated = _run_store.record_result(run.run_id, exit_code=proc.returncode, output=proc.stdout or "")
     return json.dumps({"success": proc.returncode == 0, "run": asdict(updated), "command": spec.argv, "output": (proc.stdout or "")[-4000:]})
 
 
 async def _run_capture(argv: list[str], cwd: str | None = None, timeout: int = 600) -> tuple[int, str]:
+    if not argv:
+        return 0, "Hermes is the active/default harness for this profile. No external worker command was launched; continue orchestration in the current Hermes session."
     proc = await asyncio.create_subprocess_exec(
         *argv,
         cwd=cwd,
@@ -246,8 +252,10 @@ async def _handle_run_event(gateway: Any, event: Any, raw_args: str) -> None:
     )
     task.run_id = run.run_id
     task.canvas_url = run.links["canvas"]
+    task.remote_cli_url = run.links.get("remote_cli", "")
+    task.vscode_url = run.links.get("vscode", "")
     _store.save(task)
-    await _post_to_thread(gateway, event, f"Planning `{args.goal}` with `{args.harness}` / `{args.model}`…\nRepo: {args.repo or '(not set)'}\nWorkdir: {args.workdir or '(not set)'}\nCanvas: {task.canvas_url}")
+    await _post_to_thread(gateway, event, f"Planning `{args.goal}` with `{args.harness}` / `{args.model}`…\nRepo: {args.repo or '(not set)'}\nWorkdir: {args.workdir or '(not set)'}\nCanvas: {task.canvas_url}\nRemote CLI: {task.remote_cli_url or '(not available)'}\nVS Code: {task.vscode_url or '(not available)'}")
     code, output = await _run_capture(spec.argv, cwd=spec.cwd, timeout=600)
     _run_store.record_result(run.run_id, exit_code=code, output=output)
     if code != 0:
@@ -362,6 +370,8 @@ async def _launch_plan_continuation(task_id: str, prompt: str, body: dict | None
     )
     task.run_id = run.run_id
     task.canvas_url = run.links["canvas"]
+    task.remote_cli_url = run.links.get("remote_cli", "")
+    task.vscode_url = run.links.get("vscode", "")
     logger.info("Harness plan continuation prepared: task=%s run=%s argv=%s", task_id, run.run_id, spec.argv)
     code, output = await _run_capture(spec.argv, cwd=spec.cwd, timeout=600)
     _run_store.record_result(run.run_id, exit_code=code, output=output)
@@ -403,6 +413,8 @@ async def _launch_auto(task_id: str, body: dict | None = None) -> None:
     )
     task.run_id = run.run_id
     task.canvas_url = run.links["canvas"]
+    task.remote_cli_url = run.links.get("remote_cli", "")
+    task.vscode_url = run.links.get("vscode", "")
     logger.info("Harness auto launch prepared: task=%s run=%s argv=%s", task_id, run.run_id, spec.argv)
     if body is not None:
         post_slack_thread_message(

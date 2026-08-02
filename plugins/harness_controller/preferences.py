@@ -57,12 +57,30 @@ class HarnessPreferenceStore:
         except Exception:
             return {}
 
+    def _config_default(self, key: str = "default") -> dict[str, Any]:
+        config_path = self.root.parent / "config.yaml"
+        try:
+            import yaml
+            data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            return {}
+        harness_cfg = (data.get("harness") or {}) if isinstance(data, dict) else {}
+        if not isinstance(harness_cfg, dict):
+            return {}
+        default = harness_cfg.get(key)
+        if default is None and key == "default":
+            default = harness_cfg.get("default")
+        return default if isinstance(default, dict) else {}
+
     def _write(self, data: dict[str, Any]) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
 
     def get(self, key: str = "default") -> HarnessPreference:
-        return HarnessPreference.from_dict(self._read().get(key))
+        stored = self._read().get(key)
+        if stored:
+            return HarnessPreference.from_dict(stored)
+        return HarnessPreference.from_dict(self._config_default(key))
 
     def set(self, key: str, pref: HarnessPreference) -> None:
         data = self._read()

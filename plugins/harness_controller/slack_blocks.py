@@ -8,7 +8,16 @@ def build_plan_blocks(task: HarnessTask) -> list[dict]:
     if len(plan) > 2600:
         plan = plan[:2590] + "…"
     canvas = getattr(task, "canvas_url", "") or ""
-    canvas_line = f"\n*Open in Canvas:* <{canvas}|{canvas}>\n" if canvas else ""
+    remote_cli = getattr(task, "remote_cli_url", "") or ""
+    vscode = getattr(task, "vscode_url", "") or ""
+    link_lines = []
+    if canvas:
+        link_lines.append(f"*Open in Canvas:* <{canvas}|{canvas}>")
+    if remote_cli:
+        link_lines.append(f"*Remote CLI:* <{remote_cli}|{remote_cli}>")
+    if vscode:
+        link_lines.append(f"*VS Code:* <{vscode}|{vscode}>")
+    canvas_line = "\n" + "\n".join(link_lines) + "\n" if link_lines else ""
     return [
         {
             "type": "section",

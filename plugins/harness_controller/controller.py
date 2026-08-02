@@ -59,6 +59,8 @@ class HarnessTask:
     plan_revision: int = 0
     run_id: str = ""
     canvas_url: str = ""
+    remote_cli_url: str = ""
+    vscode_url: str = ""
     decision_log: list[DecisionLogEntry] = field(default_factory=list)
     created_at: str = field(default_factory=lambda: _now())
     updated_at: str = field(default_factory=lambda: _now())

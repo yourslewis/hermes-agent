@@ -101,6 +101,9 @@ def build_harness_command(
             argv += ["--permission-mode", "default"]
         return HarnessCommandSpec("claude-code", model, normalized_mode, wrapped, argv, workdir)
 
+    if normalized_harness == "hermes":
+        return HarnessCommandSpec("hermes", model, normalized_mode, wrapped, [], workdir)
+
     if normalized_harness == "codex":
         argv = ["codex"]
         if normalized_mode == "auto":
