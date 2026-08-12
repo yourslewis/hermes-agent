@@ -8,8 +8,8 @@ def test_harness_run_store_creates_canvas_url_and_resume_commands(tmp_path):
     run = store.create_run(
         task_id="htask_abc",
         thread_key="slack:C1:123.4",
-        harness="claude-code",
-        model="sonnet",
+        harness="codex",
+        model="gpt-5.6-sol",
         mode="auto",
         goal="Fix the bug",
         workdir="/repo",
@@ -17,16 +17,17 @@ def test_harness_run_store_creates_canvas_url_and_resume_commands(tmp_path):
     )
 
     assert run.run_id.startswith("hrun_")
-    assert run.links["canvas"] == f"https://canvas.wenhao.dev/harness?run={run.run_id}&tab=claude-code"
-    assert run.links["remote_cli"] == "https://canvas.wenhao.dev/ui/claude-code-cli/"
+    assert run.links["canvas"] == f"https://canvas.wenhao.dev/harness?run={run.run_id}&tab=codex"
+    assert run.links["resume_native"] == f"https://canvas.wenhao.dev/harness/open/{run.run_id}"
+    assert run.links["remote_cli"] == "https://canvas.wenhao.dev/ui/codex-cli/"
     assert run.links["vscode"].startswith("https://canvas.wenhao.dev/ui/vscode/")
     assert "folder=%2Frepo" in run.links["vscode"]
-    assert run.commands["resume"] == "cd /repo && claude --resume <session_id>"
+    assert run.commands["resume"] == "cd /repo && codex resume <session_id>"
     assert (tmp_path / "runs" / run.run_id / "run.json").exists()
 
     loaded = store.load(run.run_id)
     assert loaded.run_id == run.run_id
-    assert loaded.harness == "claude-code"
+    assert loaded.harness == "codex"
     assert loaded.native["transcript_path"].endswith("transcript.jsonl")
 
 
@@ -55,13 +56,48 @@ def test_session_id_capture_updates_resume_command_and_transcript(tmp_path):
     assert "session_id" in transcript.read_text(encoding="utf-8")
 
 
+def test_copilot_footer_updates_session_resume_command_and_remote_cli_link(tmp_path):
+    from plugins.harness_controller.run_registry import HarnessRunStore, detect_native_session_id
+
+    store = HarnessRunStore(tmp_path)
+    run = store.create_run(
+        task_id="htask_copilot",
+        thread_key="slack:C1:567.8",
+        harness="copilot",
+        model="claude-opus-5",
+        mode="auto",
+        goal="Fix the bug",
+        workdir="/repo",
+        source={},
+    )
+    output = """
+Done.
+
+Resume     copilot --resume=7c6ab3b3-e836-4cfb-9412-fc21bd40012d
+ --model claude-opus-5 --reasoning-effort xhigh
+"""
+
+    assert detect_native_session_id("copilot", output) == "7c6ab3b3-e836-4cfb-9412-fc21bd40012d"
+    updated = store.record_result(run.run_id, exit_code=0, output=output)
+
+    assert updated.native["session_id"] == "7c6ab3b3-e836-4cfb-9412-fc21bd40012d"
+    assert updated.commands["resume"] == (
+        "cd /repo && copilot-litellm --resume=7c6ab3b3-e836-4cfb-9412-fc21bd40012d"
+    )
+    assert updated.links["remote_cli"] == (
+        f"https://canvas.wenhao.dev/harness/open/{run.run_id}"
+        "?session=7c6ab3b3-e836-4cfb-9412-fc21bd40012d"
+    )
+
+
+
 def test_slack_plan_blocks_include_canvas_link(tmp_path):
     from plugins.harness_controller.controller import HarnessController
     from plugins.harness_controller.run_registry import HarnessRunStore
     from plugins.harness_controller.slack_blocks import build_plan_blocks
 
     controller = HarnessController.in_memory()
-    task = controller.create_task("slack:C1:123.4", "opencode", "litellm/gpt-5.5", "Fix it")
+    task = controller.create_task("slack:C1:123.4", "copilot", "claude-opus-5", "Fix it")
     controller.attach_plan(task.task_id, plan_text="Plan", auto_prompt="Run")
     run = HarnessRunStore(tmp_path).create_run(
         task_id=task.task_id,
@@ -81,10 +117,12 @@ def test_slack_plan_blocks_include_canvas_link(tmp_path):
     text = build_plan_blocks(task)[0]["text"]["text"]
 
     assert "Open in Canvas" in text
+    assert "Resume native" in text
     assert "Remote CLI" in text
     assert "VS Code" in text
     assert "https://canvas.wenhao.dev/harness?run=" in text
-    assert "https://canvas.wenhao.dev/ui/opencode-cli/" in text
+    assert "https://canvas.wenhao.dev/harness/open/" in text
+    assert "https://canvas.wenhao.dev/ui/copilot-cli/" in text
     assert "https://canvas.wenhao.dev/ui/vscode/" in text
 
 
@@ -100,19 +138,19 @@ def test_list_runs_groups_threads_by_agent_default_first_then_latest(tmp_path):
     old = store.create_run(
         task_id="htask_old",
         thread_key="slack:C1:111.1",
-        harness="opencode",
-        model="litellm/gpt-5.5",
+        harness="codex",
+        model="gpt-5.6-sol",
         mode="plan",
-        goal="Older OpenCode task",
+        goal="Older Codex task",
         source={"agent": "Selin", "thread_ts": "111.1"},
     )
     new = store.create_run(
         task_id="htask_new",
         thread_key="slack:C1:222.2",
-        harness="claude-code",
-        model="sonnet",
+        harness="copilot",
+        model="claude-opus-5",
         mode="plan",
-        goal="Newer Claude task with a long description that should still be summarized simply",
+        goal="Newer Copilot task with a long description that should still be summarized simply",
         source={"agent": "Selin", "thread_ts": "222.2"},
     )
     other = store.create_run(
@@ -142,7 +180,7 @@ def test_list_runs_groups_threads_by_agent_default_first_then_latest(tmp_path):
     assert selin["default_harness"]["harness"] == "codex"
     assert [thread["run_id"] for thread in selin["threads"]] == [new.run_id, old.run_id]
     assert selin["threads"][0]["latest_message_time"] == "2026-08-02T10:00:00+00:00"
-    assert selin["threads"][0]["about"] == "Newer Claude task with a long description that should still be summarized simply"
+    assert selin["threads"][0]["about"] == "Newer Copilot task with a long description that should still be summarized simply"
     assert {agent["agent"] for agent in grouped["agents"]} == {"Selin", "Rex"}
 
 
@@ -176,13 +214,13 @@ def test_agent_specific_default_harness_overrides_global_default(tmp_path):
 
     pref_store = HarnessPreferenceStore(tmp_path / "cfg")
     pref_store.set("default", HarnessPreference(harness="codex", model="gpt-5.6-sol", mode="plan"))
-    pref_store.set("selin", HarnessPreference(harness="opencode", model="litellm/gpt-5.5", mode="auto"))
+    pref_store.set("selin", HarnessPreference(harness="copilot", model="claude-opus-5", mode="auto"))
     store = HarnessRunStore(tmp_path)
     store.create_run(
         task_id="htask_selin",
         thread_key="slack:C1:555.5",
-        harness="claude-code",
-        model="sonnet",
+        harness="copilot",
+        model="claude-opus-5",
         mode="plan",
         goal="Selin task",
         source={"agent": "Selin"},
@@ -191,5 +229,5 @@ def test_agent_specific_default_harness_overrides_global_default(tmp_path):
     grouped = store.list_grouped_by_agent(pref_store)
     selin = next(agent for agent in grouped["agents"] if agent["agent"] == "Selin")
 
-    assert selin["default_harness"]["harness"] == "opencode"
-    assert selin["default_harness"]["model"] == "litellm/gpt-5.5"
+    assert selin["default_harness"]["harness"] == "copilot"
+    assert selin["default_harness"]["model"] == "claude-opus-5"

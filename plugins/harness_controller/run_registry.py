@@ -48,8 +48,6 @@ def normalize_harness(harness: str) -> str:
     h = (harness or "").strip().lower().replace("_", "-")
     if h in {"hermes", "self"}:
         return "hermes"
-    if h == "claude":
-        return "claude-code"
     return h
 
 
@@ -61,12 +59,34 @@ def canvas_url(run_id: str, harness: str) -> str:
 def remote_cli_url(harness: str) -> str:
     h = normalize_harness(harness)
     routes = {
-        "claude-code": "claude-code-cli",
         "codex": "codex-cli",
-        "opencode": "opencode-cli",
+        "copilot": "copilot-cli",
     }
     route = routes.get(h)
     return f"{CANVAS_ORIGIN}/ui/{route}/" if route else ""
+
+
+def resume_native_url(run_id: str, session_id: str | None = None) -> str:
+    base = f"{CANVAS_ORIGIN}/harness/open/{run_id}"
+    return f"{base}?session={quote(session_id, safe='')}" if session_id else base
+
+
+def session_id_from_argv(harness: str, argv: list[str] | None) -> str | None:
+    h = normalize_harness(harness)
+    args = list(argv or [])
+    for index, arg in enumerate(args):
+        if h == "copilot" and arg == "--resume" and index + 1 < len(args):
+            return args[index + 1].strip() or None
+        if h == "copilot" and arg.startswith("--resume="):
+            return arg.split("=", 1)[1].strip() or None
+        # `codex exec resume <session_id> [prompt]` — carry the resumed session
+        # forward so the new run points at the same native session rather than
+        # recording a blank id.
+        if h == "codex" and arg == "resume" and index + 1 < len(args):
+            candidate = args[index + 1].strip()
+            if candidate and not candidate.startswith("-"):
+                return candidate or None
+    return None
 
 
 def vscode_url(workdir: str) -> str:
@@ -83,16 +103,18 @@ def resume_command(harness: str, session_id: str | None, workdir: str = "") -> s
     h = normalize_harness(harness)
     sid = session_id or "<session_id>"
     prefix = _cd_prefix(workdir)
-    if h == "claude-code":
-        return f"{prefix}claude --resume {sid}"
-    if h == "opencode":
-        return f"{prefix}opencode -s {sid}"
     if h == "codex":
         return f"{prefix}codex resume {sid}"
+    if h == "claude-code":
+        # cwd matters: Claude scopes sessions per project directory, so the cd
+        # prefix is load-bearing here rather than cosmetic.
+        return f"{prefix}claude --resume {sid}"
     if h == "hermes":
         return f"{prefix}hermes chat -q '<handoff prompt>'"
     if h == "copilot":
-        return f"{prefix}copilot -p '<handoff prompt>' --model <model>"
+        if session_id:
+            return f"{prefix}copilot-litellm --resume={sid}"
+        return f"{prefix}copilot-litellm -p '<handoff prompt>' --model <model>"
     return f"{prefix}{h} resume {sid}"
 
 
@@ -100,15 +122,103 @@ def fork_command(harness: str, session_id: str | None, workdir: str = "") -> str
     h = normalize_harness(harness)
     sid = session_id or "<session_id>"
     prefix = _cd_prefix(workdir)
-    if h == "claude-code":
-        return f"{prefix}claude --resume {sid} --fork-session"
-    if h == "opencode":
-        return f"{prefix}opencode -s {sid} --fork"
     if h == "codex":
         return f"{prefix}codex fork {sid}"
+    if h == "claude-code":
+        return f"{prefix}claude --resume {sid} --fork-session"
     if h == "hermes":
         return f"{prefix}hermes chat -q '<fork handoff prompt>'"
     return ""
+
+
+# Claude Code prints this to stderr and exits 1 when the id is unknown *in the
+# current project directory*. This is the failure we must never mistake for
+# success: it is the only signal distinguishing "resumed" from "cold start".
+_CLAUDE_RESUME_MISS = re.compile(r"No conversation found with session ID", re.I)
+
+
+def classify_resume(
+    harness: str,
+    requested_session_id: str | None,
+    output: str,
+    exit_code: int | None = None,
+) -> dict[str, Any]:
+    """Decide whether a resume attempt actually landed on the prior session.
+
+    Returns ``{"attempted", "resumed", "session_id", "reason"}``.
+
+    The caller uses ``resumed`` to choose how to build context: True means the
+    harness kept its own history and a handoff packet would only duplicate it;
+    False means the process cold-started and the packet is the *only* context
+    it will ever have. Guessing wrong in the False direction is the expensive
+    one -- the run proceeds with no context at all -- so anything ambiguous is
+    reported as not resumed.
+    """
+    h = normalize_harness(harness)
+    requested = (requested_session_id or "").strip()
+    if not requested:
+        return {
+            "attempted": False,
+            "resumed": False,
+            "session_id": detect_native_session_id(harness, output) or "",
+            "reason": "no_session_requested",
+        }
+
+    text = output or ""
+    if _CLAUDE_RESUME_MISS.search(text):
+        return {
+            "attempted": True,
+            "resumed": False,
+            "session_id": "",
+            "reason": "session_not_found",
+        }
+
+    if exit_code not in (0, None):
+        return {
+            "attempted": True,
+            "resumed": False,
+            "session_id": "",
+            "reason": f"nonzero_exit:{exit_code}",
+        }
+
+    returned = detect_native_session_id(harness, text) or ""
+
+    if h == "claude-code":
+        # Claude runs in text mode (the prose parser needs it), so the output
+        # carries no session id to compare against. That is fine: we supplied
+        # the id, and the CLI fails loudly and non-zero on an unknown one, so
+        # "no miss message + clean exit" IS the positive signal. Any id that
+        # does come back must still match -- a different one means it forked.
+        if returned and returned != requested:
+            return {
+                "attempted": True,
+                "resumed": False,
+                "session_id": returned,
+                "reason": "session_id_mismatch",
+            }
+        return {
+            "attempted": True,
+            "resumed": True,
+            "session_id": requested,
+            "reason": "ok",
+        }
+
+    if not returned:
+        # Success is only ever confirmed by a positive signal. Silence means we
+        # cannot prove the session was reused, so we assume it was not.
+        return {
+            "attempted": True,
+            "resumed": False,
+            "session_id": "",
+            "reason": "no_session_id_in_output",
+        }
+
+    return {
+        "attempted": True,
+        "resumed": True,
+        "session_id": returned,
+        "reason": "ok",
+    }
 
 
 def detect_native_session_id(harness: str, output: str) -> str | None:
@@ -130,6 +240,16 @@ def detect_native_session_id(harness: str, output: str) -> str | None:
     m = re.search(r'"session[_-]?id"\s*:\s*"([^"]+)"', text, re.I)
     if m:
         return m.group(1).strip()
+    # Copilot prints its resumable session in the final CLI footer:
+    # "Resume     copilot --resume=<session-id>".
+    if normalize_harness(harness) == "copilot":
+        m = re.search(
+            r"\bcopilot(?:-litellm)?\s+--resume(?:=|\s+)([A-Za-z0-9][A-Za-z0-9_-]{3,})\b",
+            text,
+            re.I,
+        )
+        if m:
+            return m.group(1).strip()
     # UUID fallback for Claude/Codex session ids near session labels.
     m = re.search(r'(?:session(?:[_ -]?id)?|conversation)\D{0,30}([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})', text, re.I)
     if m:
@@ -170,8 +290,9 @@ class HarnessRunStore:
         run_id = _new_run_id()
         d = self.run_dir(run_id)
         d.mkdir(parents=True, exist_ok=True)
+        session_id = session_id_from_argv(h, argv)
         native = {
-            "session_id": "",
+            "session_id": session_id or "",
             "process_id": None,
             "tmux_session": "",
             "app_server_url": "",
@@ -181,12 +302,13 @@ class HarnessRunStore:
         }
         commands = {
             "launch": " ".join(argv or []),
-            "resume": resume_command(h, None, workdir or ""),
-            "fork": fork_command(h, None, workdir or ""),
+            "resume": resume_command(h, session_id, workdir or ""),
+            "fork": fork_command(h, session_id, workdir or ""),
         }
         links = {
             "canvas": canvas_url(run_id, h),
-            "remote_cli": remote_cli_url(h),
+            "resume_native": resume_native_url(run_id, session_id),
+            "remote_cli": resume_native_url(run_id, session_id) if session_id else remote_cli_url(h),
             "vscode": vscode_url(workdir or ""),
         }
         run = HarnessRun(
@@ -314,11 +436,32 @@ class HarnessRunStore:
     def record_result(self, run_id: str, *, exit_code: int, output: str) -> HarnessRun:
         run = self.load(run_id)
         self.append_transcript(run_id, output)
-        session_id = detect_native_session_id(run.harness, output)
+        requested = str((run.handoff or {}).get("resumed_session_id") or "")
+        verdict = classify_resume(run.harness, requested, output, exit_code)
+        if verdict["attempted"]:
+            run.native["resume"] = verdict
+            self.append_event(run_id, "resume_classified", verdict)
+        # Preference order: an id proven by this run's verdict, then one scraped
+        # from output, then the id we pinned at launch.
+        #
+        # The pinned id is NOT gated on a clean exit, deliberately. A timeout
+        # (124) or kill is precisely when resume matters most: claude persists
+        # the session to disk as it works, so a run killed at 1200s can leave
+        # hundreds of KB of real work behind. Gating on exit_code == 0 would
+        # throw away the only pointer to it and surface to the user as
+        # "native resume unavailable" on a session that exists and is intact.
+        pinned = str((run.handoff or {}).get("pinned_session_id") or "")
+        session_id = (
+            verdict.get("session_id")
+            or detect_native_session_id(run.harness, output)
+            or pinned
+        )
         if session_id:
             run.native["session_id"] = session_id
             run.commands["resume"] = resume_command(run.harness, session_id, run.workdir)
             run.commands["fork"] = fork_command(run.harness, session_id, run.workdir)
+            run.links["resume_native"] = resume_native_url(run_id, session_id)
+            run.links["remote_cli"] = resume_native_url(run_id, session_id)
             self.append_event(run_id, "native_session_detected", {"session_id": session_id})
         run.exit_code = exit_code
         run.state = "completed" if exit_code == 0 else "failed"

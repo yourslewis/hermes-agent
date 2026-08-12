@@ -180,6 +180,37 @@ Return structured sections: SUMMARY, EVIDENCE, DECISION, ACTIONS, VERIFICATION, 
 """
 
 
+def build_resume_packet(task: HarnessTask, *, user_answer: str = "") -> str:
+    """Minimal prompt for a harness session that is being resumed natively.
+
+    The session already holds the full history in its own context, so replaying
+    the handoff packet is both wasteful and risky: the packet is built from
+    task fields frozen when Hermes last captured output, and re-asserting a
+    stale plan can push the model to redo work the live session already
+    completed.
+
+    Note the contrast with ``build_handoff_packet``, which instructs the model
+    *not* to assume hidden prior context. That is correct for a cold start and
+    exactly wrong here -- on resume the prior context is real and authoritative.
+    """
+    open_q = latest_open_question(task)
+    question_text = open_q.get("question") if open_q else ""
+    lines = [
+        "You are resuming your own earlier session. Your prior context is intact "
+        "and authoritative -- do not restate or redo completed work.",
+        "",
+    ]
+    if question_text:
+        lines += [f"You asked: {question_text}", ""]
+    lines += [
+        "The user replied:",
+        user_answer or "(no answer provided)",
+        "",
+        "Continue from here. If you need more input, return an OPEN QUESTIONS section.",
+    ]
+    return "\n".join(lines)
+
+
 def build_handoff_packet(task: HarnessTask, *, user_answer: str = "") -> str:
     evidence = "\n".join(f"- {item}" for item in task.evidence[-12:]) or "- (none recorded)"
     actions = "\n".join(f"- {item}" for item in task.actions[-12:]) or "- (none recorded)"

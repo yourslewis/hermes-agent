@@ -34,7 +34,7 @@ def test_harness_run_tool_creates_run_record_with_canvas_url_without_executing(t
 
     pref_store = HarnessPreferenceStore(tmp_path / "cfg")
     pref_store.set("default", HarnessPreference(
-        harness="opencode",
+        harness="copilot",
         model="litellm/gpt-5.5",
         mode="plan",
         repo="https://github.com/org/repo",
@@ -48,14 +48,14 @@ def test_harness_run_tool_creates_run_record_with_canvas_url_without_executing(t
     result = json.loads(hc._tool_harness_run({"goal": "Smoke plan", "dry_run": True}))
 
     assert result["success"] is True
-    assert result["run"]["harness"] == "opencode"
+    assert result["run"]["harness"] == "copilot"
     assert result["run"]["repo"] == "https://github.com/org/repo"
     assert result["run"]["workdir"] == "/repo"
     assert result["run"]["branch"] == "main"
     assert result["run"]["links"]["canvas"].startswith("https://canvas.wenhao.dev/harness?run=hrun_")
-    assert result["run"]["links"]["remote_cli"] == "https://canvas.wenhao.dev/ui/opencode-cli/"
+    assert result["run"]["links"]["remote_cli"].startswith("https://canvas.wenhao.dev/harness/open/hrun_")
     assert result["run"]["links"]["vscode"].startswith("https://canvas.wenhao.dev/ui/vscode/")
-    assert "opencode" in result["command"][0]
+    assert "copilot" in result["command"][0]
 
 
 def test_harness_run_tool_with_hermes_default_does_not_spawn_external_command(tmp_path, monkeypatch):

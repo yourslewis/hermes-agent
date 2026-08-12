@@ -12,6 +12,7 @@ TaskState = Literal[
     "revising",
     "approved",
     "running_or_creating",
+    "handed_off_native",
     "done",
     "cancelled",
     "failed",
@@ -44,6 +45,7 @@ class HarnessTask:
     model: str
     goal: str
     state: TaskState = "planning"
+    mode: str = ""
     approval_action: ApprovalAction = "launch_auto"
     approve_label: str = "Approve & run auto"
     revise_label: str = "Revise plan"

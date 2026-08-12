@@ -88,7 +88,7 @@ def build_slack_ack_payloads(body: dict, text: str) -> tuple[dict | None, dict |
 
 
 def _slack_api(method: str, payload: dict) -> bool:
-    token = os.getenv("SLACK_CHLOE_BOT") or os.getenv("SLACK_BOT_TOKEN") or os.getenv("SLACK_BOT")
+    token = os.getenv("SLACK_BOT_TOKEN") or os.getenv("SLACK_BOT") or os.getenv("SLACK_CHLOE_BOT")
     if not token:
         return False
     data = json.dumps(payload).encode("utf-8")

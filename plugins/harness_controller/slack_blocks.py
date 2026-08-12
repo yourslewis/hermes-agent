@@ -50,10 +50,15 @@ def build_plan_blocks(task: HarnessTask) -> list[dict]:
     plan = task.plan_text or "No plan text captured."
     canvas = getattr(task, "canvas_url", "") or ""
     remote_cli = getattr(task, "remote_cli_url", "") or ""
+    resume_native = ""
+    if canvas and getattr(task, "run_id", ""):
+        resume_native = canvas.split("/harness?", 1)[0] + f"/harness/open/{task.run_id}"
     vscode = getattr(task, "vscode_url", "") or ""
     link_lines = []
     if canvas:
         link_lines.append(f"*Open in Canvas:* <{canvas}|{canvas}>")
+    if resume_native:
+        link_lines.append(f"*Resume native:* <{resume_native}|{resume_native}>")
     if remote_cli:
         link_lines.append(f"*Remote CLI:* <{remote_cli}|{remote_cli}>")
     if vscode:

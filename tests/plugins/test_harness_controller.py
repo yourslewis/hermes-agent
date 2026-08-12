@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 
 
 def test_copilot_auto_mapping_contains_full_autonomy_flags():
@@ -14,7 +15,11 @@ def test_copilot_auto_mapping_contains_full_autonomy_flags():
         workdir="/repo",
     )
 
-    assert spec.argv[:2] == ["copilot", "-p"]
+    # Launched via the LiteLLM BYOK wrapper when present, else bare `copilot`.
+    assert spec.argv[0] in ("copilot", os.path.expanduser("~/.local/bin/copilot-litellm"))
+    assert spec.argv[1] == "--resume"
+    assert len(spec.argv[2]) == 36
+    assert "-p" in spec.argv
     assert "--model" in spec.argv
     assert "gpt-5.4" in spec.argv
     assert "--reasoning-effort" in spec.argv
@@ -86,62 +91,47 @@ def test_codex_mode_mappings_use_top_level_policy_flags():
     assert "Do not submit duplicate expensive full jobs" in auto.prompt
 
 
-def test_opencode_mode_mappings_select_plan_vs_build_agent():
+def test_opencode_harness_is_not_supported():
+    import pytest
+
     from plugins.harness_controller.harnesses import build_harness_command
 
-    plan = build_harness_command(
-        harness="opencode",
-        model="litellm/gpt-5.5",
-        mode="plan",
-        prompt="Plan only",
-        workdir="/repo",
-    )
-    auto = build_harness_command(
-        harness="opencode",
-        model="litellm/gpt-5.5",
-        mode="auto",
-        prompt="Execute",
-        workdir="/repo",
-    )
-
-    assert plan.argv[:2] == ["opencode", "run"]
-    assert "--agent" in plan.argv
-    assert plan.argv[plan.argv.index("--agent") + 1] == "plan"
-    assert "--auto" not in plan.argv
-
-    assert "--agent" in auto.argv
-    assert auto.argv[auto.argv.index("--agent") + 1] == "build"
-    assert "--auto" in auto.argv
-    assert "AUTO execution mode" in auto.prompt
+    with pytest.raises(ValueError, match="unknown harness: opencode"):
+        build_harness_command(
+            harness="opencode",
+            model="litellm/gpt-5.5",
+            mode="plan",
+            prompt="Plan only",
+            workdir="/repo",
+        )
 
 
-def test_claude_code_mode_mappings_use_permission_modes():
+def test_claude_code_mode_mappings_use_permission_flags():
     from plugins.harness_controller.harnesses import build_harness_command
 
-    plan = build_harness_command(
-        harness="claude-code",
-        model="claude-sonnet-4-6",
-        mode="plan",
-        prompt="Plan only",
-        workdir="/repo",
-    )
-    auto = build_harness_command(
-        harness="claude-code",
-        model="claude-sonnet-4-6",
-        mode="auto",
-        prompt="Execute",
-        workdir="/repo",
-    )
+    def spec(mode):
+        return build_harness_command(
+            harness="claude-code",
+            model="claude-opus-5",
+            mode=mode,
+            prompt="Do it",
+            workdir="/repo",
+        )
+
+    plan, ask, auto = spec("plan"), spec("ask"), spec("auto")
 
     assert plan.argv[:2] == ["claude", "-p"]
-    assert "--permission-mode" in plan.argv
+    assert plan.harness == "claude-code"
     assert plan.argv[plan.argv.index("--permission-mode") + 1] == "plan"
-    assert "--dangerously-skip-permissions" not in plan.argv
-
-    assert "--permission-mode" in auto.argv
+    assert ask.argv[ask.argv.index("--permission-mode") + 1] == "default"
     assert auto.argv[auto.argv.index("--permission-mode") + 1] == "bypassPermissions"
     assert "--dangerously-skip-permissions" in auto.argv
-    assert "AUTO execution mode" in auto.prompt
+    assert "--dangerously-skip-permissions" not in plan.argv
+
+    # `claude` is an accepted alias for the same harness.
+    assert build_harness_command(
+        harness="claude", model="claude-opus-5", mode="plan", prompt="x"
+    ).harness == "claude-code"
 
 
 def test_task_state_approve_is_idempotent_and_logs_decision():
@@ -172,8 +162,8 @@ def test_cron_setup_uses_same_states_with_create_cron_action_and_custom_labels()
     controller = HarnessController.in_memory()
     task = controller.create_task(
         "slack:C1:123.4",
-        "claude-code",
-        "claude-opus-4-8",
+        "copilot",
+        "claude-opus-5",
         "Use long-task-supervision to supervise X",
         approval_action="create_cron",
         approve_label="Approve & create cron",
@@ -219,7 +209,7 @@ def test_revise_moves_plan_ready_task_back_to_revising_then_planning_prompt():
     from plugins.harness_controller.store import build_revision_packet
 
     controller = HarnessController.in_memory()
-    task = controller.create_task("slack:C1:100", "opencode", "litellm/gpt-5.5", "Draft prompt", approval_action="accept_prompt")
+    task = controller.create_task("slack:C1:100", "copilot", "claude-opus-5", "Draft prompt", approval_action="accept_prompt")
     controller.attach_plan(task.task_id, plan_text="Initial prompt", auto_prompt="Initial prompt")
 
     result = controller.request_revision(task.task_id, feedback="Ask one more verification question", actor="U1")
@@ -346,6 +336,38 @@ def test_slack_thread_message_payload_reuses_plan_thread():
     }
 
 
+def test_harness_slack_api_uses_profile_bot_token_not_chloe_token(monkeypatch):
+    import json
+    from plugins.harness_controller import slack_actions
+
+    captured = {}
+
+    class FakeResponse:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b'{"ok": true}'
+
+    def fake_urlopen(req, timeout=0):
+        captured["authorization"] = req.headers.get("Authorization") or req.headers.get("authorization")
+        captured["body"] = json.loads(req.data.decode("utf-8"))
+        return FakeResponse()
+
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-selin")
+    monkeypatch.setenv("SLACK_CHLOE_BOT", "xoxb-chloe")
+    monkeypatch.setattr(slack_actions.urllib.request, "urlopen", fake_urlopen)
+
+    assert slack_actions._slack_api("chat.postMessage", {"channel": "C1", "text": "ok"}) is True
+
+    assert captured["authorization"] == "Bearer xoxb-selin"
+
+
 def test_parse_structured_open_question_and_can_stop():
     from plugins.harness_controller.parser import parse_harness_output
 
@@ -409,7 +431,7 @@ def test_task_store_roundtrip_and_handoff_packet(tmp_path):
     from plugins.harness_controller.store import HarnessTaskStore, apply_parsed_output, build_handoff_packet, record_question_answer
 
     controller = HarnessController.in_memory()
-    task = controller.create_task("slack:C1:100", "claude-code", "claude-opus-4-8", "Verify AML")
+    task = controller.create_task("slack:C1:100", "copilot", "claude-opus-5", "Verify AML")
     apply_parsed_output(
         task,
         parse_harness_output(
@@ -468,3 +490,50 @@ def test_clarification_blocks_include_choice_and_freeform_buttons():
     action_ids = {e["action_id"] for e in actions["elements"]}
     assert "harness_answer_choice_0" in action_ids
     assert "harness_answer_other" in action_ids
+
+
+def test_task_mode_defaults_empty_and_survives_store_roundtrip(tmp_path):
+    from plugins.harness_controller.controller import HarnessController
+    from plugins.harness_controller.store import HarnessTaskStore
+
+    controller = HarnessController.in_memory()
+    task = controller.create_task("slack:C1:100", "codex", "gpt-5.6-sol", "Fix flaky test")
+    assert task.mode == ""
+
+    task.mode = "auto"
+    store = HarnessTaskStore(tmp_path)
+    store.save(task)
+    assert store.load(task.task_id).mode == "auto"
+
+
+def test_plan_continuation_uses_task_mode_instead_of_hardcoded_plan(monkeypatch, tmp_path):
+    from plugins import harness_controller as hc
+    from plugins.harness_controller.harnesses import build_harness_command
+    from plugins.harness_controller.store import HarnessTaskStore
+
+    task = hc._controller.create_task("slack:C1:200", "codex", "gpt-5.6-sol", "Ship it")
+    task.mode = "auto"
+    monkeypatch.setattr(hc, "_store", HarnessTaskStore(tmp_path))
+    hc._store.save(task)
+
+    seen = {}
+
+    def fake_build(*, harness, model, mode, prompt, workdir, session_id=None, new_session_id=None):
+        seen["mode"] = mode
+        seen["session_id"] = session_id
+        seen["new_session_id"] = new_session_id
+        return build_harness_command(
+            harness=harness, model=model, mode=mode, prompt=prompt, workdir=workdir
+        )
+
+    async def fake_capture(argv, cwd=None, timeout=None, stdin_text=None):
+        seen["timeout"] = timeout
+        return 0, "## SUMMARY\ndone\n"
+
+    monkeypatch.setattr(hc, "build_harness_command", fake_build)
+    monkeypatch.setattr(hc, "_run_capture", fake_capture)
+
+    asyncio.run(hc._launch_plan_continuation(task.task_id, "continue please", None))
+
+    assert seen["mode"] == "auto"
+    assert seen["timeout"] == 1200
