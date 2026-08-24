@@ -1,0 +1,6 @@
+name: harness_controller
+version: 0.1.0
+description: "Hermes-side supervisor for selecting external coding harnesses, planning, Slack approval, auto execution, unblock monitoring, and decision logging."
+author: "Hermes Agent"
+hooks:
+  - pre_gateway_dispatch
