@@ -2681,6 +2681,88 @@ def _dequeue_pending_event(adapter, session_key: str) -> MessageEvent | None:
     return adapter.get_pending_message(session_key)
 
 
+async def _deliver_queued_followup_first_response(
+    adapter,
+    source,
+    stream_consumer,
+    first_response: str,
+    *,
+    session_key: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Deliver a completed turn's first response before processing a queued
+    follow-up, without producing a visible duplicate post.
+
+    The stream consumer has ALREADY posted this turn's reply to the channel
+    (via ``adapter.send`` / progressive edits), but its *content* could not be
+    confirmed as the final response — e.g. the finalizing edit carried only the
+    last preview snapshot, or a long reply was split so no single message
+    carries the full text (#71643).  The legacy behavior here posted the first
+    response AGAIN via a fresh ``adapter.send``, which surfaces on Slack as two
+    near-identical consecutive messages (the "replies twice" symptom).
+
+    Prefer editing the already-posted streamed message up to the complete
+    response in place — the same pattern the normal completed-turn path uses in
+    its stale-finalize and transformed branches — so the user sees ONE
+    corrected message.  This is only attempted when the consumer holds a single
+    editable message (a real ``message_id``, not the ``__no_edit__`` sentinel,
+    and not a multi-message split delivery).  Any other case, or a failed edit,
+    falls back to the original fresh send so the complete answer always reaches
+    the user.
+
+    Returns True when the in-place edit delivered the response, False when the
+    fresh-send fallback was used (or delivery failed).
+    """
+    _sc = stream_consumer
+    _sc_msg_id = getattr(_sc, "message_id", None)
+    _sc_adapter = getattr(_sc, "adapter", None)
+    if (
+        _sc is not None
+        and _sc_msg_id
+        and _sc_msg_id != "__no_edit__"
+        and _sc_adapter is not None
+        and not getattr(_sc, "_turn_split_delivery", False)
+    ):
+        try:
+            _edit_kwargs = {}
+            if "metadata" in inspect.signature(_sc_adapter.edit_message).parameters:
+                _edit_kwargs["metadata"] = metadata
+            _res = await _sc_adapter.edit_message(
+                chat_id=source.chat_id,
+                message_id=_sc_msg_id,
+                content=first_response,
+                finalize=True,
+                **_edit_kwargs,
+            )
+            if getattr(_res, "success", True):
+                logger.info(
+                    "Queued follow-up for session %s: edited streamed message %s in place with the complete first response (no duplicate post).",
+                    session_key or "?", _sc_msg_id,
+                )
+                return True
+            logger.warning(
+                "Queued follow-up in-place edit reported failure for session %s (%s); falling back to a fresh send.",
+                session_key or "?",
+                getattr(_res, "error", None),
+            )
+        except Exception as _edit_err:
+            logger.warning(
+                "Queued follow-up in-place edit failed for session %s: %s; falling back to a fresh send.",
+                session_key or "?", _edit_err,
+            )
+    try:
+        logger.info(
+            "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
+            session_key or "?",
+        )
+        await adapter.send(source.chat_id, first_response, metadata=metadata)
+        return False
+    except Exception as e:
+        logger.warning("Failed to send first response before queued message: %s", e)
+        return False
+
+
+
 _INTERRUPT_REASON_STOP = "Stop requested"
 _INTERRUPT_REASON_RESET = "Session reset requested"
 _INTERRUPT_REASON_TIMEOUT = "Execution timed out (inactivity)"
@@ -24479,18 +24561,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             session_key or "?",
                         )
                     elif first_response and not _already_streamed:
-                        try:
-                            logger.info(
-                                "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
-                                session_key or "?",
-                            )
-                            await adapter.send(
-                                source.chat_id,
-                                first_response,
-                                metadata=_status_thread_metadata,
-                            )
-                        except Exception as e:
-                            logger.warning("Failed to send first response before queued message: %s", e)
+                        # The stream consumer already posted this turn's reply
+                        # (adapter.send / edit), but its *content* couldn't be
+                        # confirmed as the final response — e.g. the finalizing
+                        # edit carried only the last preview snapshot, or a long
+                        # reply was split so no single message carries the full
+                        # text (#71643).  Legacy behavior re-posted the first
+                        # response via a fresh send, surfacing on Slack as two
+                        # near-identical consecutive messages.  The helper
+                        # prefers editing the already-posted streamed message up
+                        # to the complete response in place (one corrected
+                        # message) and only falls back to the fresh send when no
+                        # single editable message is available or the edit fails.
+                        await _deliver_queued_followup_first_response(
+                            adapter,
+                            source,
+                            _sc,
+                            first_response,
+                            session_key=session_key,
+                            metadata=_status_thread_metadata,
+                        )
                     elif first_response:
                         logger.info(
                             "Queued follow-up for session %s: skipping resend because final streamed delivery was confirmed.",
