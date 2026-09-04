@@ -18,6 +18,13 @@ export const PTY_RESUME_RECONNECT_THROTTLE_MS = 1000;
 // and force-closed so `onclose` → scheduleReconnect can recover it.
 export const PTY_CONNECTING_TIMEOUT_MS = 8000;
 
+// Browsers can leave a WebSocket object in OPEN after a mobile app switch,
+// radio handoff, or tab restore even though the TCP path is no longer usable.
+// Recycle an apparently-open viewer after a meaningful background interval;
+// the server-side PTY remains alive and ?attach= replays the scrollback.
+export const PTY_MOBILE_OPEN_SOCKET_RECONNECT_AFTER_MS = 1500;
+export const PTY_DESKTOP_OPEN_SOCKET_RECONNECT_AFTER_MS = 30000;
+
 // How long after a resumed socket opens we keep suppressing ANSI erase codes
 // (`ESC[K` / `ESC[X`) from the PTY stream. Ink's two-pass virtual scroll emits
 // them while replaying a long session; past that replay they are legitimate
@@ -35,6 +42,9 @@ export interface PtyResumeReconnectInput {
   socketReadyState?: number | null;
   ptyState: PtyConnectionState;
   connectInFlight?: boolean;
+  hiddenAtMs?: number | null;
+  nowMs?: number;
+  mobileLike?: boolean;
 }
 
 const WS_CONNECTING = 0;
@@ -49,6 +59,9 @@ export function shouldReconnectPtyOnPageResume({
   socketReadyState,
   ptyState,
   connectInFlight,
+  hiddenAtMs,
+  nowMs,
+  mobileLike,
 }: PtyResumeReconnectInput): boolean {
   if (!isActive || !online || visibilityState === "hidden") {
     return false;
@@ -57,6 +70,16 @@ export function shouldReconnectPtyOnPageResume({
     return false;
   }
   if (socketReadyState === WS_OPEN) {
+    const hiddenAt = typeof hiddenAtMs === "number" ? hiddenAtMs : null;
+    if (hiddenAt !== null) {
+      const elapsed = (nowMs ?? Date.now()) - hiddenAt;
+      const threshold = mobileLike
+        ? PTY_MOBILE_OPEN_SOCKET_RECONNECT_AFTER_MS
+        : PTY_DESKTOP_OPEN_SOCKET_RECONNECT_AFTER_MS;
+      if (elapsed >= threshold) {
+        return true;
+      }
+    }
     return false;
   }
   // A connect is mid-flight (the async socket-open IIFE is awaiting its

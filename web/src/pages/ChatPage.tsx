@@ -200,6 +200,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   const forceFreshPtyRef = useRef(false);
   const blockedInputNoticeRef = useRef(false);
   const lastResumeReconnectAtRef = useRef(0);
+  const pageHiddenAtRef = useRef<number | null>(null);
   // True from the moment the connect effect begins until the socket resolves
   // (open or close). Guards the page-resume reconnect against firing during
   // the async ticket/URL await gap where wsRef.current is not yet assigned.
@@ -300,6 +301,12 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     typeof window !== "undefined"
       ? window.matchMedia("(max-width: 1023px)").matches
       : false,
+  );
+  const mobileLike = useMemo(
+    () =>
+      typeof navigator !== "undefined" &&
+      /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent),
+    [],
   );
 
   const { theme } = useTheme();
@@ -748,16 +755,13 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       textarea.setAttribute("autocapitalize", "off");
       textarea.setAttribute("spellcheck", "false");
 
-      const isMobileLike =
-        typeof navigator !== "undefined" &&
-        /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
       const markReplacementInput = (ev: Event) => {
         const input = ev as InputEvent;
         if (
           shouldTreatInputAsMobileReplacement(
             input.inputType,
             input.data,
-            isMobileLike,
+            mobileLike,
           )
         ) {
           mobileReplacementInputUntilRef.current = Date.now() + MOBILE_REPLACEMENT_WINDOW_MS;
@@ -1273,6 +1277,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     resumeParam,
     scopedProfile,
     reconnectNonce,
+    mobileLike,
   ]);
 
   // When the user returns to the chat tab (isActive: false → true), the
@@ -1339,6 +1344,9 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         socketReadyState,
         ptyState: ptyStateRef.current,
         connectInFlight: connectInFlightRef.current,
+        hiddenAtMs: pageHiddenAtRef.current,
+        nowMs: Date.now(),
+        mobileLike,
       })
     ) {
       const now = Date.now();
@@ -1346,24 +1354,40 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         return;
       }
       lastResumeReconnectAtRef.current = now;
+      // Clear the marker before recycling the socket so a burst of
+      // focus/pageshow/online events cannot repeatedly reconnect an already-
+      // fresh OPEN socket. Future backgrounding will set it again below.
+      pageHiddenAtRef.current = null;
       reconnectPty();
     }
-  }, [banner, isActive, reconnectPty]);
+  }, [banner, isActive, mobileLike, reconnectPty]);
 
   useEffect(() => {
     if (!isActive || typeof window === "undefined") {
       return;
     }
 
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "hidden") {
+        pageHiddenAtRef.current = Date.now();
+        return;
+      }
+      maybeReconnectOnPageResume();
+    };
+    const onPageHide = () => {
+      pageHiddenAtRef.current = Date.now();
+    };
     const onResume = () => maybeReconnectOnPageResume();
 
-    document.addEventListener("visibilitychange", onResume);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    window.addEventListener("pagehide", onPageHide);
     window.addEventListener("pageshow", onResume);
     window.addEventListener("focus", onResume);
     window.addEventListener("online", onResume);
 
     return () => {
-      document.removeEventListener("visibilitychange", onResume);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      window.removeEventListener("pagehide", onPageHide);
       window.removeEventListener("pageshow", onResume);
       window.removeEventListener("focus", onResume);
       window.removeEventListener("online", onResume);

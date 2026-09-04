@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  PTY_DESKTOP_OPEN_SOCKET_RECONNECT_AFTER_MS,
+  PTY_MOBILE_OPEN_SOCKET_RECONNECT_AFTER_MS,
   shouldBlockPtyInput,
   shouldReconnectPtyOnPageResume,
 } from "./pty-reconnect";
@@ -42,6 +44,48 @@ describe("shouldReconnectPtyOnPageResume", () => {
         ptyState: "open",
       }),
     ).toBe(false);
+  });
+
+  it("recycles an apparently-open mobile socket after returning from background", () => {
+    expect(
+      shouldReconnectPtyOnPageResume({
+        isActive: true,
+        visibilityState: "visible",
+        online: true,
+        socketReadyState: 1,
+        ptyState: "open",
+        hiddenAtMs: 1_000,
+        nowMs: 1_000 + PTY_MOBILE_OPEN_SOCKET_RECONNECT_AFTER_MS,
+        mobileLike: true,
+      }),
+    ).toBe(true);
+  });
+
+  it("keeps an apparently-open desktop socket unless the background gap was long", () => {
+    expect(
+      shouldReconnectPtyOnPageResume({
+        isActive: true,
+        visibilityState: "visible",
+        online: true,
+        socketReadyState: 1,
+        ptyState: "open",
+        hiddenAtMs: 1_000,
+        nowMs: 1_000 + PTY_DESKTOP_OPEN_SOCKET_RECONNECT_AFTER_MS - 1,
+        mobileLike: false,
+      }),
+    ).toBe(false);
+    expect(
+      shouldReconnectPtyOnPageResume({
+        isActive: true,
+        visibilityState: "visible",
+        online: true,
+        socketReadyState: 1,
+        ptyState: "open",
+        hiddenAtMs: 1_000,
+        nowMs: 1_000 + PTY_DESKTOP_OPEN_SOCKET_RECONNECT_AFTER_MS,
+        mobileLike: false,
+      }),
+    ).toBe(true);
   });
 
   it("reconnects a still-connecting socket when the page is already in reconnecting state", () => {
