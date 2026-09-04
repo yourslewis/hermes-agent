@@ -311,6 +311,30 @@ def _read_run_output(run: Any, task: Any | None = None) -> str:
     return f"{native}{CAPTURED_SECTION_DIVIDER}{captured}"
 
 
+def _fork_disclosure_line(fork_run: Any) -> str:
+    """Disclose the throwaway session a summary/answer actually ran in.
+
+    ``!hsummary`` / ``!hanswer`` deliberately do NOT resume the run's native
+    session: they are read-only side questions, and appending them would
+    pollute the working session's context with meta-dialogue that the model
+    then drags into real work. The cost of that choice is invisibility -- the
+    reply is produced in a fresh codex session that appears nowhere in the
+    Canvas "Resume native" pane, so the user cannot tell where it came from.
+
+    Naming the fork's session id restores the audit trail without giving up
+    the isolation. Empty when the id was never captured.
+    """
+    native = getattr(fork_run, "native", None) or {}
+    sid = str(native.get("session_id") or "") if isinstance(native, dict) else ""
+    if not sid:
+        return ""
+    return (
+        f"\n\n🔎 Answered in an isolated `{fork_run.harness}` session `{sid}` "
+        "(context replayed from the run; the working session is left untouched). "
+        f"Open it with `codex resume {sid}`."
+    )
+
+
 def _native_disclosure_line(run: Any) -> str:
     """One-line note when a run continued outside Hermes' view.
 
@@ -399,10 +423,18 @@ async def _handle_summary_event(gateway: Any, event: Any, raw_args: str) -> None
         summary = "No summary was returned."
     if code != 0:
         summary = f"⚠️ Summary generation exited with code {code}.\n\n{summary}"
+    # Re-load: record_result() is what detects and persists the fork's native
+    # session id, so the in-memory object from create_run() predates it.
+    try:
+        summary_run = _run_store.load(summary_run.run_id)
+    except Exception:  # pragma: no cover - defensive
+        pass
     await _post_to_thread(
         gateway,
         event,
-        _truncate_for_slack(summary, limit=2800) + _native_disclosure_line(run),
+        _truncate_for_slack(summary, limit=2800)
+        + _native_disclosure_line(run)
+        + _fork_disclosure_line(summary_run),
     )
 
 
@@ -514,10 +546,17 @@ async def _handle_run_question_event(gateway: Any, event: Any, raw_args: str) ->
         answer = "No answer was returned."
     if code != 0:
         answer = f"⚠️ Answer generation exited with code {code}.\n\n{answer}"
+    # See note in _handle_summary_event: reload to pick up the detected id.
+    try:
+        answer_run = _run_store.load(answer_run.run_id)
+    except Exception:  # pragma: no cover - defensive
+        pass
     await _post_to_thread(
         gateway,
         event,
-        _truncate_for_slack(answer, limit=2800) + _native_disclosure_line(run),
+        _truncate_for_slack(answer, limit=2800)
+        + _native_disclosure_line(run)
+        + _fork_disclosure_line(answer_run),
     )
 
 
