@@ -3009,8 +3009,16 @@ def run_job(
     agent = None
 
     # Mark this as a cron session so the approval system can apply cron_mode.
-    # This env var is process-wide and persists for the lifetime of the
-    # scheduler process — every job this process runs is a cron job.
+    #
+    # The env var is process-wide and is NOT unset when the job finishes.  It
+    # is kept only as a legacy/subprocess signal (child processes inherit the
+    # environment, and the standalone `hermes cron run` process has no
+    # ContextVar bound).  The authoritative, context-scoped marker is set via
+    # ``set_session_vars(cron_session=True)`` below — see
+    # ``gateway.session_context.is_cron_session``.  Without that, a cron job
+    # running inside a gateway process would leave this flag set forever and
+    # every later interactive session in that process would be treated as
+    # cron, silently denying its dangerous-command approvals.
     os.environ["HERMES_CRON_SESSION"] = "1"
 
     # Use ContextVars for per-job session/delivery state so parallel jobs
@@ -3069,6 +3077,7 @@ def run_job(
         # See declare_stateless_channel(). Upstream: #53027, #63142.
         async_delivery=False,
         cwd=_job_workdir or "",
+        cron_session=True,
     )
     _cron_delivery_vars = (
         "HERMES_CRON_AUTO_DELIVER_PLATFORM",
