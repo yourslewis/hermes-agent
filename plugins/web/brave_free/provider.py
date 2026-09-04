@@ -79,7 +79,7 @@ class BraveFreeWebSearchProvider(WebSearchProvider):
         try:
             resp = httpx.get(
                 _BRAVE_ENDPOINT,
-                params={"q": query, "count": count},
+                params={"q": query, "count": count, "extra_snippets": "true"},
                 headers={
                     "X-Subscription-Token": api_key,
                     "Accept": "application/json",
@@ -111,6 +111,14 @@ class BraveFreeWebSearchProvider(WebSearchProvider):
                 "title": str(r.get("title", "")),
                 "url": str(r.get("url", "")),
                 "description": str(r.get("description", "")),
+                # Paid-tier (Pro) parameter: several extra excerpt paragraphs
+                # per result. Absent on free tier / when Brave omits it, so
+                # only include the key when non-empty to keep payloads lean.
+                **(
+                    {"extra_snippets": [str(s) for s in r.get("extra_snippets") or []]}
+                    if r.get("extra_snippets")
+                    else {}
+                ),
                 "position": i + 1,
             }
             for i, r in enumerate(truncated)
