@@ -71,8 +71,14 @@ def bang_shell_enabled() -> bool:
 
     if env_var_enabled("HERMES_GATEWAY_SESSION"):
         return False
-    if env_var_enabled("HERMES_CRON_SESSION"):
-        return False
+    try:
+        from gateway.session_context import is_cron_session
+
+        if is_cron_session():
+            return False
+    except Exception:
+        if env_var_enabled("HERMES_CRON_SESSION"):
+            return False
     if (os.getenv("HERMES_SESSION_PLATFORM") or "").strip():
         return False
     return True

@@ -121,6 +121,15 @@ _CRON_AUTO_DELIVER_PLATFORM: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_P
 _CRON_AUTO_DELIVER_CHAT_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_CHAT_ID", default=_UNSET)
 _CRON_AUTO_DELIVER_THREAD_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_THREAD_ID", default=_UNSET)
 
+# Cron-session marker.  The approval system uses this to decide whether to
+# apply ``approvals.cron_mode`` (default ``deny``) instead of prompting a
+# human.  It MUST be context-scoped: when the scheduler runs inside the
+# gateway process, ``os.environ["HERMES_CRON_SESSION"] = "1"`` is global and
+# never unset, so every *interactive* session handled by that process after
+# the first cron job inherits the flag and has its dangerous-command
+# approvals silently denied.  See ``is_cron_session()``.
+_CRON_SESSION: ContextVar = ContextVar("HERMES_CRON_SESSION", default=_UNSET)
+
 _VAR_MAP = {
     "HERMES_SESSION_PLATFORM": _SESSION_PLATFORM,
     "HERMES_SESSION_SOURCE": _SESSION_SOURCE,
@@ -138,6 +147,7 @@ _VAR_MAP = {
     "HERMES_CRON_AUTO_DELIVER_PLATFORM": _CRON_AUTO_DELIVER_PLATFORM,
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
     "HERMES_CRON_AUTO_DELIVER_THREAD_ID": _CRON_AUTO_DELIVER_THREAD_ID,
+    "HERMES_CRON_SESSION": _CRON_SESSION,
 }
 
 
@@ -212,6 +222,7 @@ def set_session_vars(
     cwd: str = "",
     async_delivery: bool = True,
     ui_session_id: str = "",
+    cron_session: bool | None = None,
 ) -> list:
     """Set all session context variables and return reset tokens.
 
@@ -248,6 +259,15 @@ def set_session_vars(
         _SESSION_MESSAGE_ID.set(message_id),
         _SESSION_PROFILE.set(profile),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
+        # Bind the cron marker only when the caller states it. ``None``
+        # (the default) leaves the var _UNSET so is_cron_session() falls
+        # back to the env var — preserving behaviour for callers that
+        # predate this parameter. The gateway's inbound handler passes
+        # False explicitly, which is what beats a stale process-global
+        # HERMES_CRON_SESSION=1 from an earlier in-process cron job.
+        _CRON_SESSION.set("1" if cron_session else "")
+        if cron_session is not None
+        else _CRON_SESSION.set(_CRON_SESSION.get()),
     ]
     try:
         from agent.runtime_cwd import set_session_cwd
@@ -344,6 +364,50 @@ def reset_session_vars() -> None:
         clear_session_cwd()
     except Exception:
         pass
+
+
+def is_cron_session() -> bool:
+    """Return True when the *current context* is a cron job execution.
+
+    Replaces bare ``env_var_enabled("HERMES_CRON_SESSION")`` checks.
+
+    Resolution order:
+
+    1. The ``_CRON_SESSION`` context variable, when it was explicitly set in
+       this context (including to ``""`` by an interactive gateway session,
+       which means "definitely NOT cron").
+    2. ``os.environ["HERMES_CRON_SESSION"]`` — the legacy signal, still used
+       by the standalone ``hermes cron run`` process and by tests.
+
+    Note the asymmetry: a context value of ``"1"`` is authoritative, but a
+    context value of ``""`` only suppresses the env fallback when the
+    session-context machinery is actually driving this process (i.e. the
+    gateway bound a session).  ``clear_session_vars`` resets vars to ``""``
+    rather than unsetting them, so without that guard a standalone cron
+    process that had cleared its vars would read ``""`` and be treated as
+    non-cron — failing *open* on approvals, which is the wrong direction.
+
+    Step 1 is what fixes the cross-contamination bug: the scheduler sets the
+    process-global env var and never unsets it, so once a cron job has run
+    inside a gateway process every later interactive session looked like
+    cron and had its approvals denied.  The gateway now binds this var to
+    ``""`` per message, so an explicit context value always beats the stale
+    global.
+    """
+    import os
+
+    from utils import is_truthy_value
+
+    value = _CRON_SESSION.get()
+    if value is not _UNSET:
+        # A context that declared its own nature is authoritative, in both
+        # directions.  ``True`` = a cron job (set by the scheduler).
+        # ``False``/"" = a live gateway message, which is what overrides the
+        # stale process-global env var left behind by an earlier in-process
+        # cron job.  Approval checks only ever run *inside* a bound context,
+        # so the cleared-between-jobs state is not reachable here.
+        return is_truthy_value(value, default=False)
+    return is_truthy_value(os.getenv("HERMES_CRON_SESSION", ""), default=False)
 
 
 def get_session_env(name: str, default: str = "") -> str:
