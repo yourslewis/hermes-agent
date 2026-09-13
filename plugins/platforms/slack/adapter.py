@@ -5364,6 +5364,12 @@ class SlackAdapter(BasePlatformAdapter):
         is_command_text = command_probe_text.startswith("/")
         text = original_text
 
+        # Interview input must bypass context expansion, history wake checks,
+        # downloads and consumption watermarks, including after restart.
+        from gateway.interview_ingress import route_slack_interview
+        if await route_slack_interview(self, event, payload, original_text):
+            return
+
         # Extract quoted/forwarded content from Slack blocks.
         # Slack's modern composer embeds forwarded messages in the ``blocks``
         # array as ``rich_text_quote`` elements, which are NOT reflected in
@@ -6532,6 +6538,29 @@ class SlackAdapter(BasePlatformAdapter):
             logger.error("[Slack] send_slash_confirm failed: %s", e, exc_info=True)
             return SendResult(success=False, error=str(e))
 
+    async def send_interview_text(self, chat_id, content, metadata=None):
+        """Literal thread output; bypass slash ephemerals and media parsing."""
+        if not self._app or self._is_ignored_channel(chat_id):
+            return SendResult(success=False, error="Interview transport unavailable")
+        thread = self._resolve_thread_ts(None, metadata)
+        if not thread or not content or len(content) > 32000:
+            return SendResult(success=False, error="Invalid interview text or thread")
+        escaped = content.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        # The fallback has a separate Slack limit after escaping.
+        if len(escaped) > 39000:
+            return SendResult(success=False, error="Interview fallback too long")
+        blocks = [{"type": "section", "expand": True,
+                   "text": {"type": "plain_text", "text": content[i:i+3000], "emoji": False}}
+                  for i in range(0, len(content), 3000)]
+        try:
+            result = await self._get_client(chat_id, team_id=self._metadata_team_id(metadata)).chat_postMessage(
+                channel=chat_id, thread_ts=thread, text=escaped, blocks=blocks,
+                mrkdwn=False, parse="none", unfurl_links=False, unfurl_media=False)
+            return SendResult(success=bool(result.get("ok")), message_id=result.get("ts"))
+        except Exception as exc:
+            logger.warning("Interview text delivery failed: %s", type(exc).__name__)
+            return SendResult(success=False, error="Interview text delivery failed")
+
     async def send_clarify(
         self,
         chat_id: str,
@@ -6559,6 +6588,8 @@ class SlackAdapter(BasePlatformAdapter):
         # Open-ended prompts have no buttons — the base implementation renders
         # the plain question and arms the gateway text-intercept for us.
         if not choices:
+            if clarify_id.startswith('iv:'):
+                return await self.send_interview_text(chat_id, question, metadata=metadata)
             return await super().send_clarify(
                 chat_id=chat_id,
                 question=question,
@@ -6593,11 +6624,24 @@ class SlackAdapter(BasePlatformAdapter):
             # 4 (+ Other = 5) so this is normally one block, but chunk anyway
             # so a larger choice list degrades gracefully instead of 400ing.
             elements = []
+            option_blocks = []
+            option_texts = []
             for idx, choice in enumerate(choices):
                 label = str(choice).strip() or f"Option {idx + 1}"
+                key = chr(ord("A") + idx)
+                option_text = f"{key}. {label}"
+                option_texts.append(option_text)
+                # Buttons truncate on narrow clients. Keep the original option
+                # in wrapping plain text, not mrkdwn that could hide link text.
+                for start in range(0, len(option_text), 3000):
+                    option_blocks.append({
+                        "type": "section",
+                        "expand": True,
+                        "text": {"type": "plain_text", "text": option_text[start:start + 3000], "emoji": False},
+                    })
                 elements.append({
                     "type": "button",
-                    "text": {"type": "plain_text", "text": label[:75], "emoji": True},
+                    "text": {"type": "plain_text", "text": f"Choose {key}", "emoji": True},
                     "action_id": f"hermes_clarify_choice_{idx}",
                     "value": f"{clarify_id}|{idx}",
                 })
@@ -6610,19 +6654,29 @@ class SlackAdapter(BasePlatformAdapter):
 
             blocks: list = [
                 {"type": "section", "text": {"type": "mrkdwn", "text": body}},
+                *option_blocks,
             ]
             for start in range(0, len(elements), 5):
                 blocks.append({"type": "actions", "elements": elements[start:start + 5]})
 
+            # Never silently truncate an option to fit Slack's message limits.
+            fallback_options = "\n\n".join(option_texts).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            fallback_text = body + "\n\n" + fallback_options
+            if len(blocks) > 50 or len(fallback_text) > 35000:
+                return SendResult(success=False, error="Clarification options are too long for one Slack card; ask a smaller question.")
             kwargs: Dict[str, Any] = {
                 "channel": chat_id,
-                "text": body,
+                "text": fallback_text,
+                "mrkdwn": False,
+                "parse": "none",
+                "unfurl_links": False,
+                "unfurl_media": False,
                 "blocks": blocks,
             }
             if thread_ts:
                 kwargs["thread_ts"] = thread_ts
 
-            result = await self._get_client(chat_id).chat_postMessage(**kwargs)
+            result = await self._get_client(chat_id, team_id=self._metadata_team_id(metadata)).chat_postMessage(**kwargs)
             msg_ts = result.get("ts", "")
             if msg_ts:
                 # Mark unresolved so the action handler's atomic-pop guard can
@@ -6991,16 +7045,19 @@ class SlackAdapter(BasePlatformAdapter):
                 "type": "section",
                 "text": {"type": "mrkdwn", "text": question_text or "Clarification"},
             },
-            {
-                "type": "context",
-                "elements": [{"type": "mrkdwn", "text": decision_text}],
-            },
         ]
+        # A selected option can exceed a context block's text limit too.
+        # Preserve its literal full text using wrapping sections on update.
+        for start in range(0, len(decision_text), 3000):
+            updated_blocks.append({
+                "type": "section",
+                "text": {"type": "plain_text", "text": decision_text[start:start + 3000], "emoji": False},
+            })
         try:
             await self._get_client(channel_id).chat_update(
                 channel=channel_id,
                 ts=msg_ts,
-                text=decision_text,
+                text=(question_text or "Clarification") + "\n\n" + decision_text,
                 blocks=updated_blocks,
             )
         except Exception as e:
@@ -7034,6 +7091,13 @@ class SlackAdapter(BasePlatformAdapter):
             logger.warning("[Slack] Malformed clarify value: %s", value)
             return
         clarify_id, token = value.split("|", 1)
+
+        # Interview cards survive restart and own their replay/identity checks.
+        # Route before the process-local ordinary-clarify double-click guard.
+        if clarify_id.startswith("iv:"):
+            from gateway.interview import handle_interview_action
+            await handle_interview_action(self, body, clarify_id, token)
+            return
 
         # Double-click guard — atomic pop; first caller gets False (proceed),
         # any later click gets the True default and bails (mirrors approval).

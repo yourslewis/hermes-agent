@@ -1,0 +1,35 @@
+questions:
+  - id: coding-compatibility
+    category: coding
+    priority: high
+    ask_when: An API, file format, runtime, or existing client might need backward compatibility.
+    skip_when: Compatibility requirements are already explicit or discoverable in approved local context.
+    question: Which existing clients or interfaces must remain compatible?
+    resolves: Compatibility guarantees and migration requirements.
+    examples:
+      - task: Replace the configuration parser.
+        good: Must existing configuration files continue to work without migration?
+        bad: What language is this repository, when its manifest is available?
+  - id: coding-tests
+    category: coding
+    priority: high
+    ask_when: The required verification level is unclear and changes scope or cost.
+    skip_when: Acceptance tests and required regression coverage are already known.
+    question: What evidence should a later implementation provide before this is accepted?
+    choices: [Focused unit tests, Integration coverage, End-to-end acceptance, Performance benchmark]
+    resolves: Verification expectations and required test environments.
+    examples:
+      - task: Fix a reconnect bug.
+        good: Must acceptance include reconnecting after a server restart as well as a brief network drop?
+        bad: Should I skip tests to finish faster?
+  - id: coding-target
+    category: coding
+    priority: high
+    ask_when: The intended runtime or deployment target would materially change the design.
+    skip_when: Target environment and supported versions are explicit or available in approved context.
+    question: Which environment must the eventual implementation support first?
+    resolves: Runtime, deployment target, and environment constraints; no deployment approval.
+    examples:
+      - task: Add a background worker.
+        good: Must it run in the existing container service or on a single local machine?
+        bad: Should I deploy it to production now?

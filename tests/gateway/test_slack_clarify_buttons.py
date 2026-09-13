@@ -116,15 +116,19 @@ class TestSlackSendClarify:
         blocks = kwargs["blocks"]
         assert blocks[0]["type"] == "section"
         assert "Which environment?" in blocks[0]["text"]["text"]
-        assert blocks[1]["type"] == "actions"
-        elements = blocks[1]["elements"]
+        option_blocks = [b for b in blocks[1:] if b["type"] == "section"]
+        assert [b["text"]["text"] for b in option_blocks] == ["A. staging", "B. production"]
+        elements = next(b["elements"] for b in blocks if b["type"] == "actions")
         # 2 choices + Other
         assert len(elements) == 3
         assert elements[0]["action_id"] == "hermes_clarify_choice_0"
         assert elements[0]["value"] == "cid1|0"
         assert elements[1]["action_id"] == "hermes_clarify_choice_1"
         assert elements[1]["value"] == "cid1|1"
-        assert elements[0]["text"]["text"] == "staging"
+        assert elements[0]["text"]["text"] == "Choose A"
+        assert elements[1]["text"]["text"] == "Choose B"
+        assert "A. staging" in kwargs["text"]
+        assert "B. production" in kwargs["text"]
         # Final button is the free-text "Other"
         assert elements[2]["action_id"] == "hermes_clarify_other"
         assert elements[2]["value"] == "cid1|other"
@@ -133,6 +137,67 @@ class TestSlackSendClarify:
                 action_ids = [element["action_id"] for element in block["elements"]]
                 assert len(action_ids) == len(set(action_ids))
 
+
+    @pytest.mark.asyncio
+    async def test_long_options_wrap_without_loss_and_click_returns_full_text(self):
+        from tools import clarify_gateway as cm
+
+        adapter = _make_adapter()
+        _attach_auth_runner(adapter)
+        client = adapter._team_clients["T1"]
+        client.chat_postMessage = AsyncMock(return_value={"ts": "long.1"})
+        choices = ["Read local files without changes. " * 110,
+                   "Keep <literal> & *all* details, including the final sentence."]
+        cm.register("long", "sk-long", "Choose a scope", choices)
+        result = await adapter.send_clarify(
+            chat_id="C1", question="Choose a scope", choices=choices,
+            clarify_id="long", session_key="sk-long", metadata={"thread_id": "thread.1"},
+        )
+        assert result.success
+        sent = client.chat_postMessage.call_args.kwargs
+        sections = [b for b in sent["blocks"][1:] if b["type"] == "section"]
+        assert all(len(b["text"]["text"]) <= 3000 for b in sections)
+        assert all(b["text"]["type"] == "plain_text" for b in sections)
+        assert all(b.get("expand") is True for b in sections)
+        assert "".join(b["text"]["text"] for b in sections) == (
+            "A. " + choices[0].strip() + "B. " + choices[1]
+        )
+        assert choices[0].strip() in sent["text"]
+        assert "&lt;literal&gt; &amp;" in sent["text"]
+        assert sent["mrkdwn"] is False
+        assert sent["unfurl_links"] is False
+        assert sent["unfurl_media"] is False
+        assert sent["thread_ts"] == "thread.1"
+        body = {
+            "message": {"ts": "long.1", "blocks": sent["blocks"]},
+            "channel": {"id": "C1"}, "user": {"id": "U_N", "name": "norbert"},
+        }
+        await adapter._handle_clarify_action(
+            AsyncMock(), body, {"action_id": "hermes_clarify_choice_0", "value": "long|0"},
+        )
+        entry = cm._entries["long"]
+        assert entry.response == choices[0]
+        updated = client.chat_update.call_args.kwargs
+        assert "Choose a scope" in updated["text"]
+        assert choices[0] in updated["text"]
+        assert not any(b["type"] == "actions" for b in updated["blocks"])
+        assert all(len(b["text"]["text"]) <= 3000
+                   for b in updated["blocks"] if b["type"] == "section")
+        assert choices[0] in "".join(
+            b["text"]["text"] for b in updated["blocks"][1:]
+        )
+
+    @pytest.mark.asyncio
+    async def test_oversized_options_fail_explicitly_instead_of_sending_invalid_blocks(self):
+        adapter = _make_adapter()
+        client = adapter._team_clients["T1"]
+        result = await adapter.send_clarify(
+            chat_id="C1", question="Pick", choices=["x" * 150000],
+            clarify_id="too-long", session_key="sk-long",
+        )
+        assert not result.success
+        assert "too long" in (result.error or "").lower()
+        client.chat_postMessage.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_mrkdwn_escapes_question(self):

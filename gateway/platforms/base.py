@@ -5545,6 +5545,13 @@ class BasePlatformAdapter(ABC):
 
         coerce_plaintext_gateway_command(event)
 
+        # Interview admission must precede cancel/steer/queue guards. In
+        # particular, rejecting a foreign /reset *after* cancellation is too late.
+        if self.platform == Platform.SLACK:
+            from gateway.interview import adapter_interview_admission
+            if await adapter_interview_admission(self, event):
+                return
+
         # Rewrite ``event.source.thread_id`` via the installed recovery hook
         # (Telegram DM topic mode) so the session key, guard checks, and
         # downstream delivery all agree on the same lane.
