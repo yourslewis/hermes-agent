@@ -3812,6 +3812,14 @@ class BasePlatformAdapter(ABC):
 
         if event.allow_gateway_control:
             coerce_plaintext_gateway_command(event)
+
+        # Interview admission must precede cancel/steer/queue guards. In
+        # particular, rejecting a foreign /reset *after* cancellation is too late.
+        if self.platform == Platform.SLACK:
+            from gateway.interview import adapter_interview_admission
+            if await adapter_interview_admission(self, event):
+                return
+
         expected_session_key = str((event.metadata or {}).get("gateway_session_key") or "").strip()
         # Explicitly routed events already name their destination; recovering a
         # different topic would redirect them and yield before the session claim.

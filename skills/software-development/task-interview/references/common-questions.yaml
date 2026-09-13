@@ -1,0 +1,91 @@
+questions:
+  - id: common-outcome
+    category: common
+    priority: high
+    ask_when: The task names an activity but not the outcome it should produce.
+    skip_when: The intended outcome is already explicit.
+    question: What should be different when this task is finished?
+    choices: []
+    resolves: The objective against which scope can be judged.
+    examples:
+      - task: Improve our onboarding.
+        good: Which onboarding problem should this solve first?
+        bad: Can you give me more details?
+  - id: common-audience
+    category: common
+    priority: medium
+    ask_when: Different audiences would need different content or behavior.
+    skip_when: The target audience and their use case are already known.
+    question: Who will use the result, and what will they use it for?
+    resolves: Audience, assumed knowledge, and intended use.
+    examples:
+      - task: Write a migration guide.
+        good: Is this for service owners migrating code or operators running the rollout?
+        bad: Who is this for, even though you already said service owners?
+  - id: common-scope
+    category: common
+    priority: high
+    ask_when: The request could expand into multiple independent deliverables.
+    skip_when: Included work and non-goals are already bounded.
+    question: What must the first version include, and what should it explicitly leave out?
+    resolves: Scope boundaries and non-goals.
+    examples:
+      - task: Build a customer portal.
+        good: Should the first version cover invoices only, or also account administration?
+        bad: Shall I build billing, analytics, chat, and a mobile app too?
+  - id: common-acceptance
+    category: common
+    priority: high
+    ask_when: Success lacks an observable acceptance criterion.
+    skip_when: A measurable or reviewable definition of done is already given.
+    question: What observable result would make this task successful?
+    resolves: Acceptance criteria and definition of done.
+    examples:
+      - task: Speed up the report.
+        good: What report size and completion time should the result meet?
+        bad: Should it be fast and good?
+  - id: common-constraints
+    category: common
+    priority: high
+    ask_when: Timeline, budget, accessibility, privacy, or technical constraints could change the approach.
+    skip_when: Relevant hard constraints are already stated or immaterial.
+    question: Which deadline or hard constraint must the proposed approach respect?
+    resolves: Non-negotiable limits and tradeoffs.
+    examples:
+      - task: Prepare a conference demo.
+        good: Must the demo run offline at the venue?
+        bad: What is your entire organization's budget?
+  - id: common-permissions
+    category: common
+    priority: high
+    ask_when: Future execution might affect shared systems, sensitive data, or external recipients.
+    skip_when: The affected systems and required approvals are already explicit.
+    question: Which future actions would require separate approval before anyone executes them?
+    resolves: Risk boundaries without granting execution authority.
+    examples:
+      - task: Plan a database cleanup.
+        good: Should the plan stop at a reviewed deletion proposal before any production change?
+        bad: Can I delete production records now?
+  - id: common-dependencies
+    category: common
+    priority: medium
+    ask_when: A missing input, decision, or external owner could block the deliverable.
+    skip_when: Dependencies are known or there are none that affect the result.
+    question: What input or approval must be available before this work can succeed?
+    resolves: Dependencies, owners, and blockers.
+    examples:
+      - task: Plan a vendor migration.
+        good: Is the export format finalized, or should the plan include confirming it?
+        bad: List every dependency your organization has.
+  - id: common-deliverable
+    category: common
+    priority: medium
+    ask_when: The output could reasonably be a document, code change, analysis, or presentation.
+    skip_when: The user has specified the artifact and format.
+    question: What deliverable should a later execution request produce?
+    choices: [Written recommendation, Code change, Data analysis, Presentation]
+    resolves: Artifact type and format, not permission to produce it during the interview.
+    examples:
+      - task: Help me evaluate these options.
+        good: Should the eventual result be a short recommendation or a comparison table?
+        bad: Do you want the PDF you already requested?

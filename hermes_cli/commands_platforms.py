@@ -382,7 +382,10 @@ _SLACK_RESERVED_COMMANDS = frozenset({
 # parity test reads this set. Aliases are never pinned ahead of canonicals.
 _SLACK_VIA_HERMES_ONLY = frozenset({
     "topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat",
-    "refine", "review", "pause", "whoami", "platform", "insights", "login"})
+    "refine", "review", "pause", "whoami", "platform", "insights", "login",
+    # Interview uses /hermes interview or a bot-mentioned plaintext /interview
+    # in an existing thread; do not displace a native slash at Slack's 50 cap.
+    "interview"})
 
 
 def _sanitize_slack_name(raw: str) -> str:

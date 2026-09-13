@@ -1,0 +1,47 @@
+questions:
+  - id: research-decision
+    category: research
+    priority: high
+    ask_when: A topic is supplied but the decision the research should support is unclear.
+    skip_when: The decision, alternatives, and decision-maker are already known.
+    question: What decision should the research help you make?
+    resolves: Research objective and comparison criteria.
+    examples:
+      - task: Research vector databases.
+        good: Are you selecting a service for production or surveying techniques for a paper?
+        bad: Tell me everything about databases.
+  - id: research-evidence
+    category: research
+    priority: high
+    ask_when: Different evidence standards would change the research approach or confidence.
+    skip_when: Required sources and acceptable uncertainty are already specified.
+    question: What evidence standard should the eventual research meet?
+    choices: [Primary sources, Peer-reviewed studies, Official documentation, Exploratory overview]
+    resolves: Source quality, corroboration, and confidence requirements.
+    examples:
+      - task: Compare two health interventions.
+        good: Should the report prioritize systematic reviews over individual studies?
+        bad: Would you prefer reliable facts or guesses?
+  - id: research-freshness
+    category: research
+    priority: high
+    ask_when: The subject changes over time and the relevant date range is unspecified.
+    skip_when: An as-of date or historical window is already specified.
+    question: What date range or as-of date should the research cover?
+    resolves: Freshness requirements and historical scope.
+    examples:
+      - task: Review AI regulations.
+        good: Should this cover rules currently in force or also announced future requirements?
+        bad: Here are today's regulations, without accessing current sources.
+  - id: research-output
+    category: research
+    priority: medium
+    ask_when: The depth, structure, or citation style of the research output remains unclear.
+    skip_when: Output length, structure, and source references are already agreed.
+    question: How should the eventual findings be organized for your decision?
+    choices: [Short cited brief, Comparison table, Detailed literature review, Annotated source list]
+    resolves: Research deliverable structure and depth.
+    examples:
+      - task: Evaluate renewable energy options for a board meeting.
+        good: Would a cited comparison table with a short recommendation fit the board's review?
+        bad: Shall I make a fifty-page report regardless of your meeting needs?

@@ -50,6 +50,10 @@ from gateway.platforms.base import (
 )
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 
+
+class _ClarifyTooLong(Exception):
+    """Clarify card exceeds Slack's block/text limits — fail loudly, never truncate an option."""
+
 try:  # sibling module; support both package and flat plugin-dir import
     from .block_kit import render_blocks, sanitize_blocks
 except ImportError:  # pragma: no cover - plugin loaded outside package context
@@ -4428,6 +4432,12 @@ class SlackAdapter(BasePlatformAdapter):
             original_text = command_probe_text
         is_command_text = command_probe_text.startswith("/")
         text = original_text
+
+        # Interview input must bypass context expansion, history wake checks,
+        # downloads and consumption watermarks, including after restart.
+        from gateway.interview_ingress import route_slack_interview
+        if await route_slack_interview(self, event, payload, original_text):
+            return
         # Quoted/forwarded block text is absent from flat ``text``. Skipped for commands: after
         # the ``!``→``/`` rewrite it no longer dedupes and would become bogus arguments.
         blocks = event.get("blocks")
@@ -4747,11 +4757,18 @@ class SlackAdapter(BasePlatformAdapter):
 
     async def _post_interactive_blocks(
         self, chat_id: str, text: str, blocks: list, metadata: Optional[Dict[str, Any]], *,
-        sanitize: bool = True, team_scoped: bool = True):
-        """chat.postMessage with ``blocks`` (threaded via metadata); returns the raw response."""
+        sanitize: bool = True, team_scoped: bool = True,
+        extra_kwargs: Optional[Dict[str, Any]] = None):
+        """chat.postMessage with ``blocks`` (threaded via metadata); returns the raw response.
+
+        ``extra_kwargs`` lets a caller pin literal-rendering flags (``mrkdwn``,
+        ``parse``, ``unfurl_*``) that must not apply to every interactive prompt.
+        """
         kwargs: Dict[str, Any] = {
             "channel": chat_id, "text": text,
             "blocks": sanitize_blocks(blocks) if sanitize else blocks}
+        if extra_kwargs:
+            kwargs.update(extra_kwargs)
         thread_ts = self._resolve_thread_ts(None, metadata)
         if thread_ts:
             kwargs["thread_ts"] = thread_ts
@@ -4762,7 +4779,8 @@ class SlackAdapter(BasePlatformAdapter):
         self, chat_id: str, metadata: Optional[Dict[str, Any]],
         build: Callable[[], Tuple[str, list]], label: str, *,
         resolved: Optional[Dict[Any, bool]] = None, resolved_max: int = 0,
-        team_scoped_key: bool = True, sanitize: bool = True) -> SendResult:
+        team_scoped_key: bool = True, sanitize: bool = True,
+        extra_kwargs: Optional[Dict[str, Any]] = None) -> SendResult:
         """Shared body of the Block Kit prompt senders: DM-resolve, ``build()`` -> ``(fallback
         text, blocks)``, post, then mark the message unresolved in ``resolved`` (double-click
         guard). Any failure is logged as ``<label> failed`` and returned, never raised."""
@@ -4772,7 +4790,8 @@ class SlackAdapter(BasePlatformAdapter):
         try:
             text, blocks = build()
             result = await self._post_interactive_blocks(
-                chat_id, text, blocks, metadata, sanitize=sanitize, team_scoped=team_scoped_key)
+                chat_id, text, blocks, metadata, sanitize=sanitize, team_scoped=team_scoped_key,
+                extra_kwargs=extra_kwargs)
             msg_ts = result.get("ts", "")
             if msg_ts and resolved is not None:
                 key = msg_ts
@@ -4781,6 +4800,8 @@ class SlackAdapter(BasePlatformAdapter):
                 resolved[key] = False
                 self._trim_oldest_dict_entries(resolved, resolved_max)
             return SendResult(success=True, message_id=msg_ts, raw_response=result)
+        except _ClarifyTooLong:
+            raise  # explicit caller-visible refusal, not a transport failure
         except Exception as e:
             logger.error("[Slack] %s failed: %s", label, e, exc_info=True)
             return SendResult(success=False, error=str(e))
@@ -5237,6 +5258,29 @@ class SlackAdapter(BasePlatformAdapter):
             )
             return
 
+    async def send_interview_text(self, chat_id, content, metadata=None):
+        """Literal thread output; bypass slash ephemerals and media parsing."""
+        if not self._app or self._is_ignored_channel(chat_id):
+            return SendResult(success=False, error="Interview transport unavailable")
+        thread = self._resolve_thread_ts(None, metadata)
+        if not thread or not content or len(content) > 32000:
+            return SendResult(success=False, error="Invalid interview text or thread")
+        escaped = content.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        # The fallback has a separate Slack limit after escaping.
+        if len(escaped) > 39000:
+            return SendResult(success=False, error="Interview fallback too long")
+        blocks = [{"type": "section", "expand": True,
+                   "text": {"type": "plain_text", "text": content[i:i+3000], "emoji": False}}
+                  for i in range(0, len(content), 3000)]
+        try:
+            result = await self._get_client(chat_id, team_id=self._metadata_team_id(metadata)).chat_postMessage(
+                channel=chat_id, thread_ts=thread, text=escaped, blocks=blocks,
+                mrkdwn=False, parse="none", unfurl_links=False, unfurl_media=False)
+            return SendResult(success=bool(result.get("ok")), message_id=result.get("ts"))
+        except Exception as exc:
+            logger.warning("Interview text delivery failed: %s", type(exc).__name__)
+            return SendResult(success=False, error="Interview text delivery failed")
+
     async def send_clarify(
         self, chat_id: str, question: str, choices: Optional[list], clarify_id: str,
         session_key: str, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
@@ -5244,6 +5288,8 @@ class SlackAdapter(BasePlatformAdapter):
         (value ``clarify_id|idx``) plus "✏️ Other…" (``hermes_clarify_other``), which flips the
         entry into text-capture mode for the gateway's text-intercept. No choices → base impl."""
         if not choices:
+            if clarify_id.startswith('iv:'):
+                return await self.send_interview_text(chat_id, question, metadata=metadata)
             return await super().send_clarify(
                 chat_id=chat_id, question=question, choices=choices, clarify_id=clarify_id,
                 session_key=session_key, metadata=metadata)
@@ -5259,26 +5305,53 @@ class SlackAdapter(BasePlatformAdapter):
             # Slack caps an actions block at 5 elements; clarify caps choices at 4 (+ Other) but
             # chunk anyway so larger lists degrade gracefully instead of 400ing.
             elements = []
+            option_blocks = []
+            option_texts = []
             for idx, choice in enumerate(choices):
                 label = str(choice).strip() or f"Option {idx + 1}"
+                key = chr(ord("A") + idx)
+                option_text = f"{key}. {label}"
+                option_texts.append(option_text)
+                # Buttons truncate on narrow clients. Keep the original option
+                # in wrapping plain text, not mrkdwn that could hide link text.
+                for start in range(0, len(option_text), 3000):
+                    option_blocks.append({
+                        "type": "section",
+                        "expand": True,
+                        "text": {"type": "plain_text", "text": option_text[start:start + 3000], "emoji": False},
+                    })
                 elements.append(
                     self._button(
-                        label[:75], f"hermes_clarify_choice_{idx}",
+                        f"Choose {key}", f"hermes_clarify_choice_{idx}",
                         f"{clarify_id}|{idx}", emoji=True))
             elements.append(
                 self._button("✏️ Other…", "hermes_clarify_other", f"{clarify_id}|other", emoji=True)
             )
-            blocks: list = [{"type": "section", "text": {"type": "mrkdwn", "text": body}}]
+            blocks: list = [
+                {"type": "section", "text": {"type": "mrkdwn", "text": body}},
+                *option_blocks,
+            ]
             for start in range(0, len(elements), 5):
                 blocks.append({"type": "actions", "elements": elements[start : start + 5]})
-            return body, blocks
+            # Never silently truncate an option to fit Slack's message limits.
+            fallback_options = "\n\n".join(option_texts).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            fallback_text = body + "\n\n" + fallback_options
+            if len(blocks) > 50 or len(fallback_text) > 35000:
+                raise _ClarifyTooLong(
+                    "Clarification options are too long for one Slack card; ask a smaller question.")
+            return fallback_text, blocks
 
         # Bare-ts key (not workspace-scoped) so the action handler's atomic-pop guard
         # can reject double-clicks (mirrors _approval_resolved).
-        result = await self._send_interactive_prompt(
-            chat_id, metadata, _build, "send_clarify",
-            resolved=self._clarify_resolved, resolved_max=self._CLARIFY_RESOLVED_MAX,
-            team_scoped_key=False, sanitize=False)
+        try:
+            result = await self._send_interactive_prompt(
+                chat_id, metadata, _build, "send_clarify",
+                resolved=self._clarify_resolved, resolved_max=self._CLARIFY_RESOLVED_MAX,
+                team_scoped_key=False, sanitize=False,
+                extra_kwargs={"mrkdwn": False, "parse": "none",
+                              "unfurl_links": False, "unfurl_media": False})
+        except _ClarifyTooLong as exc:
+            return SendResult(success=False, error=str(exc))
         if result.success and result.message_id:
             question_text, _blocks = _build()
             response_channel = str((result.raw_response or {}).get("channel") or chat_id)

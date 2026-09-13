@@ -751,6 +751,20 @@ class GatewayBusySessionMixin:
                 return True
             return False  # base adapter queues silently behind the active turn
 
+        if event.source.platform == Platform.SLACK:
+            try:
+                from gateway.interview import route_interview
+                handled, response = await route_interview(self, event)
+            except Exception:
+                logger.error("Interview busy routing failed closed", exc_info=True)
+                handled, response = True, 'Interview state unavailable; dispatch stopped safely.'
+            if handled:
+                adapter = self._adapter_for_source(event.source)
+                if response and adapter:
+                    await adapter.send(chat_id=event.source.chat_id, content=response,
+                        metadata=self._thread_metadata_for_source(event.source))
+                return True
+
         # Same authorization gate as the cold path, else unauthorized users in shared threads
         # inject messages into a session they don't own.
         from gateway.run import _AGENT_PENDING_SENTINEL
