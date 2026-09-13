@@ -210,6 +210,23 @@ class GatewayInboundMixin:
         # scale-to-zero: only real user-originated inbound stamps the last-inbound clock;
         # counting internal/system events would keep a genuinely idle gateway awake.
         self._scale_to_zero_note_real_inbound()
+
+        # Persistent interview routing is a core boundary, before fail-open
+        # plugin hooks (which can otherwise start an external harness).
+        if source.platform == Platform.SLACK:
+            try:
+                from gateway.interview import route_interview
+                _handled, _response = await route_interview(self, event)
+            except Exception:
+                logger.error("Interview routing unavailable; refusing Slack dispatch", exc_info=True)
+                event._interview_response = (
+                    "Interview state is unavailable. Dispatch stopped safely; no task was executed."
+                )
+                return None
+            if _handled:
+                event._interview_response = _response
+                return None
+
         event = self._hm_pre_gateway_dispatch_hook(event, source)
         if event is None:
             return None
@@ -1255,7 +1272,9 @@ class GatewayInboundMixin:
         from gateway.run import _AGENT_PENDING_SENTINEL
         _admitted = await self._hm_admit_event(event)
         if _admitted is None:
-            return None
+            # Interview routing (inside admission, ahead of fail-open plugin hooks)
+            # handles the turn itself; carry its reply back out to the caller.
+            return getattr(event, "_interview_response", None)
         event, source, is_internal = _admitted
         # TERMINAL-DECLINE LATCH TEARDOWN. Deliberately placed AFTER admission,
         # not on the adapter's raw inbound: profile routing, the ignored-channel
