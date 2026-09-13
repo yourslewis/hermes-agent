@@ -5364,6 +5364,12 @@ class SlackAdapter(BasePlatformAdapter):
         is_command_text = command_probe_text.startswith("/")
         text = original_text
 
+        # Interview input must bypass context expansion, history wake checks,
+        # downloads and consumption watermarks, including after restart.
+        from gateway.interview_ingress import route_slack_interview
+        if await route_slack_interview(self, event, payload, original_text):
+            return
+
         # Extract quoted/forwarded content from Slack blocks.
         # Slack's modern composer embeds forwarded messages in the ``blocks``
         # array as ``rich_text_quote`` elements, which are NOT reflected in
@@ -6532,6 +6538,29 @@ class SlackAdapter(BasePlatformAdapter):
             logger.error("[Slack] send_slash_confirm failed: %s", e, exc_info=True)
             return SendResult(success=False, error=str(e))
 
+    async def send_interview_text(self, chat_id, content, metadata=None):
+        """Literal thread output; bypass slash ephemerals and media parsing."""
+        if not self._app or self._is_ignored_channel(chat_id):
+            return SendResult(success=False, error="Interview transport unavailable")
+        thread = self._resolve_thread_ts(None, metadata)
+        if not thread or not content or len(content) > 32000:
+            return SendResult(success=False, error="Invalid interview text or thread")
+        escaped = content.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        # The fallback has a separate Slack limit after escaping.
+        if len(escaped) > 39000:
+            return SendResult(success=False, error="Interview fallback too long")
+        blocks = [{"type": "section", "expand": True,
+                   "text": {"type": "plain_text", "text": content[i:i+3000], "emoji": False}}
+                  for i in range(0, len(content), 3000)]
+        try:
+            result = await self._get_client(chat_id, team_id=self._metadata_team_id(metadata)).chat_postMessage(
+                channel=chat_id, thread_ts=thread, text=escaped, blocks=blocks,
+                mrkdwn=False, parse="none", unfurl_links=False, unfurl_media=False)
+            return SendResult(success=bool(result.get("ok")), message_id=result.get("ts"))
+        except Exception as exc:
+            logger.warning("Interview text delivery failed: %s", type(exc).__name__)
+            return SendResult(success=False, error="Interview text delivery failed")
+
     async def send_clarify(
         self,
         chat_id: str,
@@ -6559,6 +6588,8 @@ class SlackAdapter(BasePlatformAdapter):
         # Open-ended prompts have no buttons — the base implementation renders
         # the plain question and arms the gateway text-intercept for us.
         if not choices:
+            if clarify_id.startswith('iv:'):
+                return await self.send_interview_text(chat_id, question, metadata=metadata)
             return await super().send_clarify(
                 chat_id=chat_id,
                 question=question,
@@ -6645,7 +6676,7 @@ class SlackAdapter(BasePlatformAdapter):
             if thread_ts:
                 kwargs["thread_ts"] = thread_ts
 
-            result = await self._get_client(chat_id).chat_postMessage(**kwargs)
+            result = await self._get_client(chat_id, team_id=self._metadata_team_id(metadata)).chat_postMessage(**kwargs)
             msg_ts = result.get("ts", "")
             if msg_ts:
                 # Mark unresolved so the action handler's atomic-pop guard can
@@ -7060,6 +7091,13 @@ class SlackAdapter(BasePlatformAdapter):
             logger.warning("[Slack] Malformed clarify value: %s", value)
             return
         clarify_id, token = value.split("|", 1)
+
+        # Interview cards survive restart and own their replay/identity checks.
+        # Route before the process-local ordinary-clarify double-click guard.
+        if clarify_id.startswith("iv:"):
+            from gateway.interview import handle_interview_action
+            await handle_interview_action(self, body, clarify_id, token)
+            return
 
         # Double-click guard — atomic pop; first caller gets False (proceed),
         # any later click gets the True default and bails (mirrors approval).

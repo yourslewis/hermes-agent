@@ -100,6 +100,10 @@ VALID_BUSY_POLICIES: frozenset[str] = frozenset(
 # ---------------------------------------------------------------------------
 
 COMMAND_REGISTRY: list[CommandDef] = [
+    CommandDef("interview", "Clarify requirements without task execution", "Session",
+               gateway_only=True, busy_policy="dispatch",
+               args_hint="<task>|status|finish|resume|exit",
+               subcommands=("status", "finish", "resume", "exit")),
     # Session
     CommandDef("start", "Acknowledge platform start pings without a reply", "Session",
                gateway_only=True, busy_policy="dispatch", busy_handler="start"),
@@ -1257,7 +1261,9 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     /hermes update on Slack. Demoted to free the native slot /approvals now
 #     claims — without this entry /approvals tips the registry past the 50-cap
 #     and silently clamps /update off, breaking Telegram parity.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update"})
+# Interview uses /hermes interview or a bot-mentioned plaintext /interview
+# in an existing thread; do not displace a native slash at Slack's 50 cap.
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "interview"})
 
 
 def _sanitize_slack_name(raw: str) -> str:

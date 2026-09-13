@@ -8463,6 +8463,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return (enriched_text or text).strip()
 
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
+        if event.source.platform == Platform.SLACK:
+            try:
+                from gateway.interview import route_interview
+                handled, response = await route_interview(self, event)
+            except Exception:
+                logger.error("Interview busy routing failed closed", exc_info=True)
+                handled, response = True, 'Interview state unavailable; dispatch stopped safely.'
+            if handled:
+                adapter = self._adapter_for_source(event.source)
+                if response and adapter:
+                    await adapter.send(chat_id=event.source.chat_id, content=response,
+                        metadata=self._thread_metadata_for_source(event.source))
+                return True
         # --- Authorization gate (#17775) ---
         # The cold path (_handle_message) checks _is_user_authorized before
         # creating a session.  The busy path must enforce the same check;
@@ -13737,6 +13750,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # clock is what the idle predicate (gateway/scale_to_zero.is_idle) reads.
         if not is_internal:
             self._scale_to_zero_note_real_inbound()
+
+        # Persistent interview routing is a core boundary, before fail-open
+        # plugin hooks (which can otherwise start an external harness).
+        if source.platform == Platform.SLACK:
+            try:
+                from gateway.interview import route_interview
+                _handled, _response = await route_interview(self, event)
+            except Exception:
+                logger.error("Interview routing unavailable; refusing Slack dispatch", exc_info=True)
+                return "Interview state is unavailable. Dispatch stopped safely; no task was executed."
+            if _handled:
+                return _response
 
         # Fire pre_gateway_dispatch plugin hook for user-originated messages.
         # Plugins receive the MessageEvent and may return a dict influencing flow:
