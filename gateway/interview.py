@@ -132,6 +132,11 @@ class InterviewController:
             denial = access_check(event.source, 'interview')
             if denial is not None:
                 return True, denial
+        if text.startswith('/interview learning '):
+            from gateway.interview_learning import learning_control
+            from hermes_constants import get_hermes_home
+            return True, await learning_control(get_hermes_home(), event.source,
+                text[len('/interview learning '):].strip())
         if not event.source.thread_id:
             return True, 'Start !interview inside a Slack thread, so its restrictions have an unambiguous scope.'
         lock = self.locks.setdefault(key, asyncio.Lock())

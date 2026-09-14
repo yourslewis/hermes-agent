@@ -87,5 +87,7 @@ async def route_slack_interview(adapter, event, payload, text):
         or (adapter._slack_allow_bots() == 'mentions' and not mentioned)
     )):
         return True
+    from gateway.interview_learning import capture_learning
+    await capture_learning(adapter, event, source, text)
     await adapter.handle_message(message)
     return True
