@@ -28,15 +28,42 @@ Use terminal interview tools rather than unstructured final text.
 """
 
 
+# Existing transcripts remain byte-for-byte intact; only new interviews pin the
+# research policy. Each new turn reports current grants to avoid stale access UX.
+LEGACY_SYSTEM_PROMPT = SYSTEM_PROMPT
+SYSTEM_PROMPT = SYSTEM_PROMPT.replace(
+    'memory, skills, hooks, delegation, web and session/history access are disabled in\nv1. Only read_file/search_files within explicitly approved read_roots are allowed.',
+    'memory, skills, hooks and delegation are disabled. Public web_search/web_extract\nand scoped history_search are read-only. Read files within approved read_roots.\nUse request_read_access for an owner approval card when a project is not approved.\nNever offer fictional approval steps or imply an ordinary answer grants access.\nCurrent runtime capability metadata is authoritative about available read tools.')
+
+
 def _validate_transcript(messages):
     """Fail closed on corrupt histories; do not rewrite any persisted prefix."""
-    if not isinstance(messages, list) or not messages or messages[0] != {'role': 'system', 'content': SYSTEM_PROMPT}:
+    if not isinstance(messages, list) or not messages or messages[0] not in (
+            {'role': 'system', 'content': SYSTEM_PROMPT},
+            {'role': 'system', 'content': LEGACY_SYSTEM_PROMPT}):
         raise ValueError('Invalid interview transcript: pinned system prompt missing')
     if len(json.dumps(messages, ensure_ascii=False).encode('utf-8')) > MAX_TRANSCRIPT_BYTES:
         raise ValueError('Interview transcript size limit reached')
     pending = set()
     previous = 'system'
+    upgraded = messages[0]['content'] == SYSTEM_PROMPT
     for message in messages[1:]:
+        if message == {'role': 'system', 'content': SYSTEM_PROMPT}:
+            if upgraded or pending:
+                raise ValueError('Invalid interview policy upgrade')
+            upgraded = True
+            continue
+        if (isinstance(message, dict) and message.get('role') == 'system'
+                and isinstance(message.get('content'), str)
+                and message['content'].startswith('Interview access grants: ')):
+            if pending:
+                raise ValueError('Invalid interview access metadata placement')
+            grants = json.loads(message['content'][len('Interview access grants: '):])
+            if (not isinstance(grants, dict) or set(grants) != {'read_roots', 'history_sessions'}
+                    or any(not isinstance(v, list) or any(not isinstance(x, str) for x in v)
+                           for v in grants.values())):
+                raise ValueError('Invalid interview access metadata')
+            continue
         if not isinstance(message, dict):
             raise ValueError('Invalid interview transcript message')
         role = message.get('role')
@@ -129,13 +156,30 @@ async def _run_turn(record, user_text, intent, completion):
         raise ValueError('Interview user_text must be a string')
     record = copy.deepcopy(record)
     messages = copy.deepcopy(record.get('messages', []))
-    turn = json.dumps({'intent': intent, 'user_text': user_text}, ensure_ascii=False)
+    turn = json.dumps({'intent': intent, 'user_text': user_text,
+        'runtime_capabilities': {'read_only_tools': ['web_search', 'web_extract', 'history_search',
+            'read_file', 'search_files'], 'permission_request': 'request_read_access',
+            'read_roots': record.get('read_roots', []),
+            'history_sessions': record.get('history_sessions', []),
+            'execution': False}}, ensure_ascii=False)
     if messages:
         _validate_transcript(messages)
+        upgrade = {'role': 'system', 'content': SYSTEM_PROMPT}
+        if messages[0]['content'] == LEGACY_SYSTEM_PROMPT and upgrade not in messages:
+            messages.append(upgrade)
     else:
         messages = [{'role': 'system', 'content': SYSTEM_PROMPT}]
         context = {key: copy.deepcopy(record.get(key)) for key in ('id', 'task', 'bank', 'source', 'read_roots')}
         turn = 'Pinned interview context (data):\n' + json.dumps(context, ensure_ascii=False) + '\nCurrent turn:\n' + turn
+    # Grants are code-owned, not user prose (which the system explicitly says
+    # cannot approve roots). Append only when changed; preserve cached prefixes.
+    grant_message = {'role': 'system', 'content': 'Interview access grants: ' + json.dumps({
+        'read_roots': record.get('read_roots', []),
+        'history_sessions': record.get('history_sessions', [])}, sort_keys=True)}
+    prior_grants = [m for m in messages if m.get('role') == 'system'
+                    and m.get('content', '').startswith('Interview access grants: ')]
+    if not prior_grants or prior_grants[-1] != grant_message:
+        messages.append(grant_message)
     messages.append({'role': 'user', 'content': turn})
     _validate_transcript(messages)
     model_kwargs = {}
@@ -177,7 +221,7 @@ async def _run_turn(record, user_text, intent, completion):
                 else:
                     result, outcome = await asyncio.to_thread(dispatch_tool,
                         call['function']['name'], args, intent=intent,
-                        read_roots=copy.deepcopy(record.get('read_roots', ())))
+                        read_roots=copy.deepcopy(record.get('read_roots', ())), record=record)
             else:
                 result = {'error': 'Denied: turn already stopped.'}
             messages.append({'role': 'tool', 'tool_call_id': call['id'],
