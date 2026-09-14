@@ -102,8 +102,8 @@ VALID_BUSY_POLICIES: frozenset[str] = frozenset(
 COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("interview", "Clarify requirements without task execution", "Session",
                gateway_only=True, busy_policy="dispatch",
-               args_hint="<task>|status|finish|resume|exit",
-               subcommands=("status", "finish", "resume", "exit")),
+               args_hint="[--project /absolute/project --] <task>|status|finish|resume|exit|approve-read <path>|approve-history <session-id>",
+               subcommands=("status", "finish", "resume", "exit", "approve-read", "approve-history")),
     # Session
     CommandDef("start", "Acknowledge platform start pings without a reply", "Session",
                gateway_only=True, busy_policy="dispatch", busy_handler="start"),
