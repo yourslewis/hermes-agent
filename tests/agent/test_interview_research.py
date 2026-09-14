@@ -5,17 +5,18 @@ from agent.interview_policy import dispatch_tool, tool_schemas
 from agent.interview_runtime import run_interview_turn
 
 
-def test_permission_request_does_not_grant_reads():
+def test_permission_request_does_not_grant_reads(tmp_path):
+    project = str(tmp_path.resolve())
     record = {'read_roots': []}
-    result, outcome = dispatch_tool('request_read_access', {'path': '/tmp/project', 'reason': 'Inspect schema'})
+    result, outcome = dispatch_tool('request_read_access', {'path': project, 'reason': 'Inspect schema'})
     assert outcome and outcome['kind'] == 'permission'
-    assert outcome['path'] == '/tmp/project'
+    assert outcome['path'] == project
     assert record['read_roots'] == []
     assert result['status'] == 'pending'
 
 
 @pytest.mark.asyncio
-async def test_existing_interview_gets_current_capabilities_without_prefix_rewrite():
+async def test_existing_interview_gets_current_capabilities_without_prefix_rewrite(tmp_path):
     from agent.interview_runtime import SYSTEM_PROMPT
     prefix = [{'role': 'system', 'content': SYSTEM_PROMPT},
               {'role': 'user', 'content': 'Old task'},
@@ -26,7 +27,7 @@ async def test_existing_interview_gets_current_capabilities_without_prefix_rewri
         seen.append(kw)
         return {'choices': [{'message': {'role': 'assistant', 'content': None, 'tool_calls': [
             {'id': 'p1', 'type': 'function', 'function': {'name': 'request_read_access',
-             'arguments': json.dumps({'path': '/tmp/other', 'reason': 'Need schema'})}}]}}]}
+             'arguments': json.dumps({'path': str(tmp_path.resolve()), 'reason': 'Need schema'})}}]}}]}
     result = await run_interview_turn(record, 'Continue', completion=completion)
     assert result['kind'] == 'permission'
     assert result['messages'][:len(prefix)] == prefix
@@ -81,7 +82,7 @@ async def test_legacy_interview_receives_authoritative_append_only_policy_upgrad
 
 
 @pytest.mark.asyncio
-async def test_runtime_passes_trusted_history_scope_and_stops_after_permission(monkeypatch):
+async def test_runtime_passes_trusted_history_scope_and_stops_after_permission(monkeypatch, tmp_path):
     import sys
     from types import SimpleNamespace
     seen = []
@@ -92,7 +93,7 @@ async def test_runtime_passes_trusted_history_scope_and_stops_after_permission(m
         nonlocal count
         count += 1
         calls = [('history_search', {})] if count == 1 else [
-            ('request_read_access', {'path': '/tmp/project', 'reason': 'schema'}),
+            ('request_read_access', {'path': str(tmp_path.resolve()), 'reason': 'schema'}),
             ('history_search', {})]
         return {'choices': [{'message': {'role': 'assistant', 'tool_calls': [
             {'id': str(count)+str(i), 'type': 'function', 'function': {'name': name,
