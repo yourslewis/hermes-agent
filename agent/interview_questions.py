@@ -100,17 +100,54 @@ def _read(name, dir_fd):
         raise QuestionBankError(f"Invalid question bank: cannot read {name} as UTF-8") from exc
 
 
+def _configured_notes_bank(home):
+    """Notes selection is independent of whether automatic learning is paused."""
+    from agent.interview_notes_bank import _json_pairs, load_notes_bank
+
+    try:
+        with _directory_path(home) as fd:
+            try:
+                os.stat("question-learning.json", dir_fd=fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return None
+            raw, _ = _read("question-learning.json", fd)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise QuestionBankError("Invalid question bank: cannot read learning configuration") from exc
+    try:
+        config = json.loads(raw, object_pairs_hook=_json_pairs)
+    except (ValueError, RecursionError) as exc:
+        raise QuestionBankError("Invalid question bank: malformed learning configuration") from exc
+    if not isinstance(config, dict) or type(config.get("enabled")) is not bool:
+        raise QuestionBankError("Invalid question bank: enabled must be a boolean")
+    root = config.get("notes_root")
+    if not isinstance(root, str) or not root.strip() or not Path(root).expanduser().is_absolute():
+        raise QuestionBankError("Invalid question bank: notes_root must be an absolute bank path")
+    cache = config.get("cache_path")
+    if cache is not None and (not isinstance(cache, str) or not cache.strip()
+                              or not Path(cache).expanduser().is_absolute()):
+        raise QuestionBankError("Invalid question bank: cache_path must be absolute")
+    return load_notes_bank(root, cache_path=cache)
+
+
 def load_question_bank(home=None) -> dict:
     """Load a pinned snapshot, preferring an explicit home over the runtime home.
 
-    Only an absent custom directory selects the shipped bank. Invalid custom
-    content raises QuestionBankError and never falls back. No caches, setup,
-    installation, learning, or writes occur here. Persist the returned snapshot
-    at interview entry; do not reload it between turns of an active interview.
+    A profile question-learning.json explicitly selects its
+    notes_root (the 03-Question-Bank directory). Only an explicitly configured
+    cache_path opts into cache writes. Otherwise all loads are read-only.
+    Absent config retains legacy custom/shipped selection unchanged.
+    Invalid configured content never silently falls back to the shipped bank.
+    Persist the snapshot at entry; do not reload between interview turns.
     """
     from hermes_constants import get_hermes_home
 
-    root = Path(home if home is not None else get_hermes_home()) / "skills" / "task-interview"
+    profile_home = Path(home if home is not None else get_hermes_home())
+    configured = _configured_notes_bank(profile_home)
+    if configured is not None:
+        return configured
+    root = profile_home / "skills" / "task-interview"
     try:
         with ExitStack() as stack:
             try:
