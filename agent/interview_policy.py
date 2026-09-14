@@ -15,7 +15,9 @@ def tool_schemas():
          {'urls': {'type': 'array', 'items': {'type': 'string'}}}, ['urls']),
         ('history_search', 'Search current interview or explicitly approved same-profile sessions only.',
          {'query': {'type': 'string'}, 'session_id': {'type': 'string'}}, []),
-        ('request_read_access', 'Ask the owner to approve a project directory using a permission card; never grants access itself.',
+        ('find_project', 'Find safe project paths by exact name in known checkout containers or approved roots; metadata only, never grants read access.',
+         {'name': {'type': 'string'}}, ['name']),
+        ('request_read_access', 'Resolve a project name or path and ask the owner for approval; ambiguous names require a choice, and this never grants access itself.',
          {'path': {'type': 'string'}, 'reason': {'type': 'string'}}, ['path', 'reason']),
         ('read_file', 'Read text under explicitly approved read_roots only.',
          {'path': {'type': 'string'}}, ['path']),
@@ -43,8 +45,22 @@ def dispatch_tool(name, arguments, *, intent='collect', read_roots=(), record=No
             if expected == 'array' and (not isinstance(value, list) or len(value) > 10
                     or any(not isinstance(item, str) or not item.strip() or len(item) > 200 for item in value)):
                 return {'error': 'Denied: choices must be up to ten short strings.'}, None
+    if name == 'find_project':
+        from gateway.interview_permissions import resolve_project_candidates
+        return {'candidates': resolve_project_candidates(arguments['name'], read_roots)}, None
     if name == 'request_read_access':
-        return {'status': 'pending'}, {'kind': 'permission', 'path': arguments['path'],
+        from gateway.interview_permissions import resolve_project_candidates
+        candidates = resolve_project_candidates(arguments['path'], read_roots)
+        if len(candidates) != 1:
+            return {'error': 'Select one existing safe project path.', 'candidates': candidates}, None
+        from gateway.interview_permissions import validate_read_root
+        for root in read_roots if isinstance(read_roots, (list, tuple)) else ():
+            try:
+                if Path(candidates[0]).is_relative_to(validate_read_root(root)):
+                    return {'status': 'already_approved', 'path': candidates[0]}, None
+            except ValueError:
+                continue
+        return {'status': 'pending'}, {'kind': 'permission', 'path': candidates[0],
                                        'reason': arguments['reason']}
     if name == 'clarify':
         return {'status': 'pending'}, {'kind': 'question', 'question': arguments['question'],
@@ -154,7 +170,12 @@ def _filesystem(name, arguments, roots):
     # Relative references resolve to the explicitly selected first project,
     # never the gateway working directory. Traversal remains rejected below.
     if isinstance(raw_path, str) and not Path(raw_path).is_absolute():
-        raw_path = str(_absolute(roots[0]) / raw_path)
+        if raw_path.startswith(('.hermes/repos/', '.hermes/worktrees/')):
+            # Only these exact checkout aliases are home-relative. They still
+            # pass the same sensitive, traversal, approval and no-follow checks.
+            raw_path = str(Path.home() / raw_path)
+        else:
+            raw_path = str(_absolute(roots[0]) / raw_path)
     path = _absolute(raw_path)
     allowed = False
     for raw in roots:

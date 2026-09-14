@@ -269,13 +269,30 @@ async def test_permission_failed_delivery_replays_durable_path(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_invalid_model_permission_cannot_offer_approval(tmp_path):
-    ctl, ui, _ = setup_controller(tmp_path, [dict(kind='permission', path='/', reason='Read all', messages=[])])
-    with pytest.raises(ValueError):
-        await ctl.handle(event('!interview Clarify'))
+@pytest.mark.parametrize('payload', [
+    {'path': '/', 'reason': 'Read all'},
+    {'path': 'project-name', 'reason': 'Read design'},
+    {'path': None, 'reason': 'Read design'},
+    {'reason': 'Missing path'},
+    {'path': 'VALID', 'reason': None},
+    {'path': 'VALID', 'reason': ''},
+    {'path': 'VALID', 'reason': 'x' * 32_769},
+])
+async def test_invalid_model_permission_cannot_offer_approval(tmp_path, payload):
+    payload = dict(payload)
+    if payload.get('path') == 'VALID':
+        payload['path'] = str(tmp_path)
+    messages = [{'role': 'assistant', 'content': 'Saved research'}]
+    ctl, ui, _ = setup_controller(tmp_path, [dict(kind='permission', messages=messages, **payload)])
+    assert await ctl.handle(event('!interview Clarify')) == (True, None)
     after = ctl.store.get(ctl.key(event('')))
     assert after['read_roots'] == [] and after['pending'] is None
     assert after['phase'] == 'paused' and ui.send_clarify.await_count == 0
+    assert after['messages'] == messages and after['busy_until'] == 0
+    assert after['plan'] == '' and after['summary'] == ''
+    notice = ui.send_interview_text.await_args.kwargs['content']
+    assert 'permission' in notice.lower() and '!interview approve-read' in notice
+    assert '/interview' not in notice
 
 
 def test_project_checkouts_allowed_but_profile_checkouts_rejected(tmp_path, monkeypatch):
@@ -368,3 +385,100 @@ async def test_permission_controls_obey_existing_admission_guards(tmp_path, guar
     finally:
         if lock.locked():
             lock.release()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('containers', [('repos',), ('repos', 'worktrees')])
+async def test_project_name_requires_path_choice_then_explicit_permission(tmp_path, monkeypatch, containers):
+    from gateway.interview import InterviewController
+    from gateway.interview_store import InterviewStore
+    home = tmp_path / 'home'
+    monkeypatch.setenv('HOME', str(home))
+    candidates = []
+    for container in containers:
+        project = home / '.hermes' / container / 'sample-app'
+        project.mkdir(parents=True)
+        candidates.append(str(project))
+    candidates.sort()
+    ctl, _, model = setup_controller(tmp_path, [question(), question()])
+    await ctl.handle(event('!interview Clarify'))
+    before = ctl.store.get(ctl.key(event('')))
+    assert await ctl.handle(event('!interview approve-read sample-app')) == (True, None)
+    choice = ctl.store.get(before['key'])
+    assert choice['pending']['kind'] == 'project_choice'
+    assert choice['pending']['choices'] == candidates
+    assert choice['read_roots'] == []
+    for field in ('id', 'task', 'bank', 'messages', 'answers'):
+        assert choice[field] == before[field]
+    assert model.await_count == 1
+    await ctl.handle(event('approve it'))
+    await ctl.accept(choice['key'], choice['pending']['nonce'], 'other', 'U1', 'T1', 'C1', 'th1', 'card1')
+    assert ctl.store.get(choice['key']) == choice
+    ctl = InterviewController(ctl.runner, InterviewStore(tmp_path / 'interviews.sqlite3'), ctl.bank_loader)
+    await ctl.handle(event('!interview resume'))
+    replay = ctl.store.get(choice['key'])
+    assert replay['pending']['choices'] == candidates
+    assert replay['pending']['nonce'] != choice['pending']['nonce']
+    await ctl.accept(choice['key'], choice['pending']['nonce'], '0', 'U1', 'T1', 'C1', 'th1', 'card1')
+    assert ctl.store.get(choice['key']) == replay
+    await ctl.accept(replay['key'], replay['pending']['nonce'], '0', 'U1', 'T1', 'C1', 'th1', 'card1')
+    permission = ctl.store.get(choice['key'])
+    assert permission['pending']['kind'] == 'read_permission'
+    assert permission['pending']['path'] == candidates[0]
+    assert permission['read_roots'] == [] and model.await_count == 1
+    await ctl.accept(permission['key'], permission['pending']['nonce'], '0', 'U1', 'T1', 'C1', 'th1', 'card1')
+    assert ctl.store.get(choice['key'])['read_roots'] == [candidates[0]]
+    assert model.await_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('entry', [True, False])
+async def test_tilde_project_path_is_expanded_and_validated_without_symlink_resolution(tmp_path, monkeypatch, entry):
+    home = tmp_path / 'home'
+    project = home / 'project'
+    project.mkdir(parents=True)
+    monkeypatch.setenv('HOME', str(home))
+    ctl, _, model = setup_controller(tmp_path, [question()])
+    if entry:
+        response = await ctl.handle(event('!interview --project ~/project -- Clarify'))
+    else:
+        await ctl.handle(event('!interview Clarify'))
+        response = await ctl.handle(event('!interview approve-read ~/project'))
+    rec = ctl.store.get(ctl.key(event('')))
+    assert rec is not None, response
+    assert rec['read_roots'] == [str(project)]
+    assert model.await_count == 1
+    project.rmdir()
+    project.symlink_to(tmp_path, target_is_directory=True)
+    before = ctl.store.get(rec['key'])
+    _, response = await ctl.handle(event('!interview approve-read ~/project'))
+    assert 'denied' in response.lower()
+    assert ctl.store.get(rec['key']) == before
+
+
+@pytest.mark.asyncio
+async def test_bare_project_entry_is_actionable_and_does_not_guess(tmp_path):
+    ctl, _, model = setup_controller(tmp_path, [])
+    _, response = await ctl.handle(event('!interview --project sample-app -- Clarify'))
+    assert '!interview approve-read' in response and '!interview <task>' in response
+    assert ctl.store.get(ctl.key(event(''))) is None and model.await_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('scenario', ['no_thread', 'complete', 'paused', 'stop', 'disabled_command', 'other'])
+async def test_controller_user_facing_guidance_uses_bang_syntax(tmp_path, scenario):
+    ctl, _, _ = setup_controller(tmp_path, [question()])
+    if scenario == 'no_thread':
+        _, response = await ctl.handle(event('!interview', thread=''))
+    else:
+        await ctl.handle(event('!interview Clarify'))
+        rec = ctl.store.get(ctl.key(event('')))
+        if scenario == 'other':
+            response = await ctl.accept(rec['key'], rec['pending']['nonce'], 'other',
+                                        'U1', 'T1', 'C1', 'th1', 'card1')
+        else:
+            if scenario in {'complete', 'paused'}:
+                ctl.store.update(rec['key'], rec['revision'], phase=scenario, pending=None)
+            text = {'stop': '/stop', 'disabled_command': '/hrun task'}.get(scenario, 'run it')
+            _, response = await ctl.handle(event(text))
+    assert '!interview' in response and '/interview' not in response
