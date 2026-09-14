@@ -42,7 +42,7 @@ async def deliver_digest(adapter, home, source, now=None):
             # during network I/O stay pending. A crash before this commit may repeat
             # the digest, but cannot silently lose changes.
             with sqlite3.connect(path) as db:
-                db.executemany('UPDATE events SET delivered=1 WHERE event_id=?',[(row[0],) for row in rows])
+                db.executemany('UPDATE events SET delivered=1 WHERE event_id=? AND state=? AND question_id IS ? AND created=?', rows)
                 db.execute('INSERT OR REPLACE INTO digest_delivery(id,sent) VALUES(1,?)',(now,))
         except (OSError, ValueError, TypeError, sqlite3.Error):
             return
