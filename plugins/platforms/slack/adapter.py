@@ -6284,6 +6284,9 @@ class SlackAdapter(BasePlatformAdapter):
             text, chat_id=channel_id, team_id=team_id
         )
 
+        # Learning uses sender text, never quoted blocks or hydrated thread history.
+        from gateway.interview_learning import capture_learning
+        await capture_learning(self, event, source, original_text)
         msg_event = MessageEvent(
             text=(command_probe_text if is_command_text else text),
             message_type=msg_type,
