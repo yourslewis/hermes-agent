@@ -34,6 +34,7 @@ command-count limit; there is no Slack app-manifest update to perform.
 | `!interview <task>` | Start a restricted interview in the current thread. A task is required. |
 | `!interview --project /absolute/project -- <task>` | Select a project and grant bounded reads when starting. `--read-root` is an alias. |
 | `!interview approve-read /absolute/project` | Add an approved project to the current interview without restarting or losing answers. |
+| `!interview approve-read NAME` | Find exact project-name matches, select a directory, then explicitly approve its read permission card. Even a unique match needs confirmation. |
 | `!interview approve-history SESSION_ID` | Approve a specific eligible prior session for this interview. |
 | `!interview status` | Show phase, research capabilities, approved read roots, and history-session grants without a model call. |
 | `!interview finish` | Request the requirements summary now, including unresolved items. |
@@ -71,6 +72,25 @@ pause the interview rather than remove its restrictions. Use explicit
 
 ## Research, permissions, and execution restrictions
 
+### Research budget recovery
+
+When the restricted runtime reaches its iteration or time budget, Hermes saves
+the valid conversation checkpoint, the reason (`iterations` or `timeout`), and
+bounded tool-name/status diagnostics before sending a recovery card:
+
+- **Continue research:** start another restricted research turn using saved findings.
+- **Summarize what is known:** request a requirements summary that labels incomplete
+  research and unresolved items. This does not authorize planning.
+- **Stop here:** pause with findings retained and execution still disabled.
+
+The recovery card is code-owned, not a model-generated approval request. Only
+the owner can use the current card in the bound conversation. **Other**, free
+text, stale clicks, and waiting never authorize planning or execution.
+`!interview resume` reissues an unanswered recovery card with a new nonce, even
+after restart or failed delivery, without restarting research automatically.
+The controller's outer timeout is 240 seconds; its persisted 300-second lease
+outlasts that timeout so another process cannot take over an in-flight turn.
+
 The interview runs in a **restricted research loop**, not the ordinary
 task-execution loop. Public **web search and page extraction are available by
 default**, using credential-free DuckDuckGo HTML search with Bing RSS fallback
@@ -96,6 +116,24 @@ If the interview is already running, do not restart it:
 !interview approve-read "/absolute/path/to/project"
 ```
 
+An absolute path is an explicit direct read grant. `~/project` expands relative
+to the gateway user's home and undergoes the same no-symlink validation; it does
+not resolve symlinks to bypass the policy. Bare names use a separate workflow:
+
+```text
+!interview approve-read sample-app
+```
+
+Hermes probes exact immediate-child matches under `~/.hermes/repos/` and
+`~/.hermes/worktrees/`, plus matching already-approved roots. It does not search
+the whole disk or infer a path from task text. A **project selection** card shows
+the exact canonical candidates, including when there is only one match. Choosing
+a directory creates a separate **Approve read access / Deny read access** card;
+selection alone never adds a grant. Both cards are owner-bound and resumable.
+If no safe match exists, supply an absolute project path. `--project NAME` at
+entry does not guess: start `!interview <task>`, then use
+`!interview approve-read NAME`, or start with an absolute/`~/` project path.
+
 This preserves the task, question bank, messages, and recorded answers. Each root
 must be an existing absolute directory; symlinks (including parent symlinks), `/`,
 home directories, broad non-project containers, profile state, and protected
@@ -113,6 +151,12 @@ be reissued with `!interview resume` after a failure or restart. Only the owner
 and exact current card in the bound conversation can approve it; approval
 revalidates the directory. Other/free text, natural-language agreement, and
 ordinary model-generated question choices never grant permissions.
+
+An invalid model-provided permission path or reason pauses the interview with
+an explanatory notice rather than offering a bogus approval or planning card.
+Saved research remains available. Use `!interview approve-read /absolute/project`
+(or a project name), then `!interview resume`; use `!interview finish` if you want
+to summarize the available findings instead.
 
 ### Approve history explicitly
 

@@ -53,6 +53,34 @@ def validate_read_root(raw: str) -> str:
         raise ValueError(ROOT_ERROR) from exc
 
 
+def resolve_project_candidates(raw: str, read_roots=()) -> list[str]:
+    """Resolve project references without granting access or reading file contents."""
+    if not isinstance(raw, str) or not raw or len(raw) > 32_768:
+        return []
+    path = Path(raw)
+    if raw.startswith('~/'):
+        path = Path.home() / raw[2:]
+    elif path.parts[:2] in {('.hermes', 'repos'), ('.hermes', 'worktrees')}:
+        path = Path.home() / path
+    if not path.is_absolute() and len(path.parts) == 1 and path.name not in {'.', '..'}:
+        # Exact immediate-child probes avoid directory enumeration altogether:
+        # two fixed lookups, never a recursive or working-directory search.
+        paths = [Path.home() / '.hermes' / container / path.name
+                 for container in ('repos', 'worktrees')]
+        if isinstance(read_roots, (list, tuple)):
+            paths.extend(Path(root) for root in read_roots
+                         if isinstance(root, str) and Path(root).name == path.name)
+    else:
+        paths = [path]
+    candidates = set()
+    for path in paths:
+        try:
+            candidates.add(validate_read_root(str(path)))
+        except ValueError:
+            continue
+    return sorted(candidates)
+
+
 def single_argument(raw: str) -> str:
     try:
         tokens = shlex.split(raw)

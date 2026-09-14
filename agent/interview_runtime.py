@@ -4,10 +4,10 @@ import copy
 import inspect
 import json
 
-MAX_ITERATIONS = 6
-TURN_TIMEOUT_SECONDS = 60.0
-COMPLETION_TIMEOUT_SECONDS = 30.0
-MAX_TOOL_CALLS = 16
+MAX_ITERATIONS = 12
+TURN_TIMEOUT_SECONDS = 120.0
+COMPLETION_TIMEOUT_SECONDS = 60.0
+MAX_TOOL_CALLS = 32
 MAX_TRANSCRIPT_BYTES = 512_000
 
 from agent.interview_policy import dispatch_tool, tool_schemas
@@ -88,17 +88,19 @@ def _validate_transcript(messages):
 
 
 async def run_interview_turn(record, user_text, intent='collect', completion=None):
-    """Run one bounded turn; caller persists messages only on successful return.
+    """Run one bounded turn; caller owns persistence, including budget checkpoints.
 
     ``completion`` is an async (or sync scripted) chat-completions callable
     accepting keyword messages/tools/model and returning an SDK object or dict.
-    Errors propagate without mutating the record or falling into ordinary mode.
+    Invalid state/configuration fails precisely without mutating the record.
+    Budget exhaustion returns a closed transcript for an explicit later resume.
     """
+    checkpoint = {'messages': [], 'diagnostics': []}
     try:
         async with asyncio.timeout(TURN_TIMEOUT_SECONDS):
-            return await _run_turn(record, user_text, intent, completion)
-    except TimeoutError as exc:
-        raise RuntimeError('Interview timed out; execution remains disabled') from exc
+            return await _run_turn(record, user_text, intent, completion, checkpoint)
+    except (TimeoutError, asyncio.CancelledError):
+        return dict(checkpoint, kind='budget', reason='timeout')
 
 
 def _field(obj, key, default=None):
@@ -149,7 +151,31 @@ async def _invoke(completion, **kwargs):
     return await result if inspect.isawaitable(result) else result
 
 
-async def _run_turn(record, user_text, intent, completion):
+def _tool_status(result):
+    # Classify only; never copy error text or arguments into diagnostics.
+    error = result.get('error')
+    if not error:
+        return 'success'
+    if error in (
+            'Denied: malformed JSON tool arguments.',
+            'Denied: invalid tool arguments.',
+            'Denied: expected a nonempty bounded string.',
+            'Denied: choices must be up to ten short strings.'):
+        return 'validation_error'
+    return 'denied' if isinstance(error, str) and error.startswith('Denied:') else 'tool_error'
+
+
+def _append_tool_result(messages, diagnostics, call, result, status):
+    messages.append({'role': 'tool', 'tool_call_id': call['id'],
+                     'content': json.dumps(result)})
+    # Names are model-controlled too: unknown names may themselves be secrets.
+    known = {tool['function']['name'] for tool in tool_schemas()}
+    name = call['function']['name']
+    diagnostics.append({'tool': name if name in known else 'unknown', 'status': status})
+    del diagnostics[:-32]
+
+
+async def _run_turn(record, user_text, intent, completion, checkpoint):
     if intent not in {'collect', 'summary', 'plan'}:
         raise ValueError('Unknown interview intent')
     if not isinstance(user_text, str):
@@ -180,8 +206,15 @@ async def _run_turn(record, user_text, intent, completion):
                     and m.get('content', '').startswith('Interview access grants: ')]
     if not prior_grants or prior_grants[-1] != grant_message:
         messages.append(grant_message)
+    # A budget checkpoint can end in a user reminder (or the initial request
+    # when completion timed out). Preserve it rather than merging/replacing the
+    # persisted prefix, and separate the next user turn with a neutral marker.
+    previous = next((m['role'] for m in reversed(messages) if m['role'] != 'system'), None)
+    if previous == 'user':
+        messages.append({'role': 'assistant', 'content': 'Interview paused before completing this turn.'})
     messages.append({'role': 'user', 'content': turn})
     _validate_transcript(messages)
+    checkpoint['messages'] = copy.deepcopy(messages)
     model_kwargs = {}
     if completion is None:
         from agent.auxiliary_client import _read_main_model, _read_main_provider, resolve_provider_client
@@ -205,30 +238,55 @@ async def _run_turn(record, user_text, intent, completion):
             raise RuntimeError('Interview primary model substitution denied')
         completion = client.chat.completions.create
         model_kwargs = {'model': resolved_model}
+    diagnostics = []
     for _ in range(MAX_ITERATIONS):
-        response = await asyncio.wait_for(_invoke(completion,
-            messages=copy.deepcopy(messages), tools=tool_schemas(), **model_kwargs),
-            timeout=COMPLETION_TIMEOUT_SECONDS)
+        try:
+            response = await asyncio.wait_for(_invoke(completion,
+                messages=copy.deepcopy(messages), tools=tool_schemas(), **model_kwargs),
+                timeout=COMPLETION_TIMEOUT_SECONDS)
+        except TimeoutError:
+            raise
+        except Exception:
+            raise RuntimeError('Interview completion failed; execution remains disabled') from None
         message = _message(response)
         messages.append(message)
         outcome = None
-        for call in message.get('tool_calls', []):
+        calls = message.get('tool_calls', [])
+        for index, call in enumerate(calls):
             if outcome is None:
                 try:
                     args = json.loads(call['function']['arguments'])
                 except (ValueError, TypeError):
                     result = {'error': 'Denied: malformed JSON tool arguments.'}
                 else:
-                    result, outcome = await asyncio.to_thread(dispatch_tool,
-                        call['function']['name'], args, intent=intent,
-                        read_roots=copy.deepcopy(record.get('read_roots', ())), record=record)
+                    try:
+                        result, outcome = await asyncio.to_thread(dispatch_tool,
+                            call['function']['name'], args, intent=intent,
+                            read_roots=copy.deepcopy(record.get('read_roots', ())), record=record)
+                    except asyncio.CancelledError:
+                        # A running read-only worker cannot be killed. Never replay
+                        # it or await it here; late results cannot mutate this log.
+                        for remaining_index, remaining in enumerate(calls[index:]):
+                            status = 'interrupted' if remaining_index == 0 else 'skipped'
+                            _append_tool_result(messages, diagnostics, remaining,
+                                {'status': status, 'error': 'Interview budget stopped this call; no successful result recorded.'},
+                                status)
+                        _validate_transcript(messages)
+                        checkpoint.update(messages=copy.deepcopy(messages), diagnostics=copy.deepcopy(diagnostics))
+                        raise
+                    except Exception:
+                        result = {'error': 'Interview tool failed; execution remains disabled.'}
+                        outcome = None
             else:
                 result = {'error': 'Denied: turn already stopped.'}
-            messages.append({'role': 'tool', 'tool_call_id': call['id'],
-                             'content': json.dumps(result)})
+            _append_tool_result(messages, diagnostics, call, result, _tool_status(result))
         _validate_transcript(messages)
+        checkpoint.update(messages=copy.deepcopy(messages), diagnostics=copy.deepcopy(diagnostics))
         if outcome:
             return dict(outcome, messages=messages)
         if not message.get('tool_calls'):
             messages.append({'role': 'user', 'content': 'Use clarify, interview_finish, or (only if authorized) interview_plan to end this turn.'})
-    raise RuntimeError('Interview iteration limit reached')
+            _validate_transcript(messages)
+            checkpoint['messages'] = copy.deepcopy(messages)
+    return {'kind': 'budget', 'reason': 'iterations', 'messages': messages,
+            'diagnostics': diagnostics}

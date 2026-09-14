@@ -63,7 +63,7 @@ def test_bounded_dispatch_denies_execution_and_only_plan_intent_authorizes_plan(
             assert 'denied' in results[3]['error'].lower()
         tool_names = {t['function']['name'] for t in script.requests[0]['tools']}
         assert tool_names == {'clarify', 'interview_finish', 'interview_plan', 'read_file', 'search_files',
-                              'request_read_access', 'web_search', 'web_extract', 'history_search'}
+                              'request_read_access', 'web_search', 'web_extract', 'history_search', 'find_project'}
 
 
 def test_transcript_keeps_pinned_prompt_context_and_closes_all_calls_across_turns():
@@ -120,19 +120,22 @@ def test_malformed_arguments_denied_and_sdk_response_normalized():
     json.dumps(result['messages'])
 
 
-def test_iteration_and_timeout_bounds_fail_closed(monkeypatch):
-    import pytest
+def test_iteration_and_timeout_bounds_return_recoverable_checkpoints(monkeypatch):
     import agent.interview_runtime as runtime
     monkeypatch.setattr(runtime, 'MAX_ITERATIONS', 2)
     script = Script(reply(('terminal', {})), reply(('terminal', {})), reply(('clarify', {'question': 'Too late'})))
-    with pytest.raises(RuntimeError, match='iteration limit'):
-        asyncio.run(runtime.run_interview_turn(record(), 'Start', completion=script))
+    stopped = asyncio.run(runtime.run_interview_turn(record(), 'Start', completion=script))
+    assert stopped['kind'] == 'budget'
+    assert stopped['reason'] == 'iterations'
+    runtime._validate_transcript(stopped['messages'])
     assert len(script.requests) == 2
     monkeypatch.setattr(runtime, 'TURN_TIMEOUT_SECONDS', 0.01)
     async def hung(**kwargs):
         await asyncio.sleep(1)
-    with pytest.raises(RuntimeError, match='timed out'):
-        asyncio.run(runtime.run_interview_turn(record(), 'Start', completion=hung))
+    stopped = asyncio.run(runtime.run_interview_turn(record(), 'Start', completion=hung))
+    assert stopped['kind'] == 'budget'
+    assert stopped['reason'] == 'timeout'
+    runtime._validate_transcript(stopped['messages'])
 
 
 def test_default_completion_uses_configured_primary_model_and_async_router(monkeypatch):
