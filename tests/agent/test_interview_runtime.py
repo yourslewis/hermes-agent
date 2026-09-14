@@ -50,7 +50,7 @@ def test_bounded_dispatch_denies_execution_and_only_plan_intent_authorizes_plan(
     for intent in ('collect', 'summary', 'plan'):
         script = Script(
             reply(('terminal', {'command': 'touch /tmp/never'}),
-                  ('web_search', {'query': 'secret'}), ('session_search', {'query': 'history'})),
+                  ('delegate_task', {'goal': 'execute'}), ('session_search', {'query': 'history'})),
             reply(('interview_plan', {'text': 'Proposed steps'})),
             reply(('interview_finish', {'text': 'Requirements and unresolved items'})))
         result = asyncio.run(run_interview_turn(record(), 'Continue', intent, script))
@@ -62,7 +62,8 @@ def test_bounded_dispatch_denies_execution_and_only_plan_intent_authorizes_plan(
         if intent != 'plan':
             assert 'denied' in results[3]['error'].lower()
         tool_names = {t['function']['name'] for t in script.requests[0]['tools']}
-        assert tool_names == {'clarify', 'interview_finish', 'interview_plan', 'read_file', 'search_files'}
+        assert tool_names == {'clarify', 'interview_finish', 'interview_plan', 'read_file', 'search_files',
+                              'request_read_access', 'web_search', 'web_extract', 'history_search'}
 
 
 def test_transcript_keeps_pinned_prompt_context_and_closes_all_calls_across_turns():
@@ -72,8 +73,8 @@ def test_transcript_keeps_pinned_prompt_context_and_closes_all_calls_across_turn
                          ('interview_finish', {'text': 'Must not finish after clarify'})))
     result = asyncio.run(run_interview_turn(rec, 'Start', completion=first))
     assert result['messages'][0] == {'role': 'system', 'content': SYSTEM_PROMPT}
-    assert 'Ask about users first.' in result['messages'][1]['content']
-    assert 'v1' in result['messages'][1]['content']
+    assert 'Ask about users first.' in next(m['content'] for m in result['messages'] if m['role'] == 'user')
+    assert 'v1' in next(m['content'] for m in result['messages'] if m['role'] == 'user')
     assert json.loads(result['messages'][-1]['content'])['error'].startswith('Denied')
     rec['messages'] = result['messages']
     rec['bank']['prompt'] = 'Changed after pinning'
@@ -81,7 +82,7 @@ def test_transcript_keeps_pinned_prompt_context_and_closes_all_calls_across_turn
     second = Script(reply(('interview_finish', {'text': 'Audience is staff'})))
     end = asyncio.run(run_interview_turn(rec, 'Staff', completion=second))
     assert end['messages'][:len(saved)] == saved
-    assert sum(m['role'] == 'system' for m in end['messages']) == 1
+    assert sum(m['role'] == 'system' for m in end['messages']) == 2  # pinned policy + unchanged grants
     assert 'Changed after pinning' not in json.dumps(second.requests)
     assert first.requests[0]['tools'] == second.requests[0]['tools']
     assert rec['messages'] == saved

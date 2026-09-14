@@ -9,6 +9,14 @@ def tool_schemas():
          {'text': {'type': 'string'}}, ['text']),
         ('interview_plan', 'Return a proposal only; permitted only for intent=plan. Never execute.',
          {'text': {'type': 'string'}}, ['text']),
+        ('web_search', 'Search the public web. Never include private source contents or secrets in queries.',
+         {'query': {'type': 'string'}}, ['query']),
+        ('web_extract', 'Read public HTTP(S) pages; private networks are denied.',
+         {'urls': {'type': 'array', 'items': {'type': 'string'}}}, ['urls']),
+        ('history_search', 'Search current interview or explicitly approved same-profile sessions only.',
+         {'query': {'type': 'string'}, 'session_id': {'type': 'string'}}, []),
+        ('request_read_access', 'Ask the owner to approve a project directory using a permission card; never grants access itself.',
+         {'path': {'type': 'string'}, 'reason': {'type': 'string'}}, ['path', 'reason']),
         ('read_file', 'Read text under explicitly approved read_roots only.',
          {'path': {'type': 'string'}}, ['path']),
         ('search_files', 'Literal text search under approved read_roots only.',
@@ -20,7 +28,7 @@ def tool_schemas():
             for name, description, props, required in definitions]
 
 
-def dispatch_tool(name, arguments, *, intent='collect', read_roots=()):
+def dispatch_tool(name, arguments, *, intent='collect', read_roots=(), record=None):
     """Return (tool result, optional terminal turn result); default deny."""
     schemas = {tool['function']['name']: tool['function']['parameters'] for tool in tool_schemas()}
     schema = schemas.get(name)
@@ -35,6 +43,9 @@ def dispatch_tool(name, arguments, *, intent='collect', read_roots=()):
             if expected == 'array' and (not isinstance(value, list) or len(value) > 10
                     or any(not isinstance(item, str) or not item.strip() or len(item) > 200 for item in value)):
                 return {'error': 'Denied: choices must be up to ten short strings.'}, None
+    if name == 'request_read_access':
+        return {'status': 'pending'}, {'kind': 'permission', 'path': arguments['path'],
+                                       'reason': arguments['reason']}
     if name == 'clarify':
         return {'status': 'pending'}, {'kind': 'question', 'question': arguments['question'],
                                      'choices': arguments.get('choices', []), 'text': ''}
@@ -47,7 +58,18 @@ def dispatch_tool(name, arguments, *, intent='collect', read_roots=()):
             return _filesystem(name, arguments, read_roots), None
         except (OSError, ValueError, TypeError):
             return {'error': 'Denied: path unavailable, unsafe, or outside approved read_roots.'}, None
-    return {'error': 'Denied: tool is not authorized in interview mode (web/history disabled in v1).'}, None
+    if name in {'web_search', 'web_extract', 'history_search'}:
+        try:
+            if name == 'history_search':
+                from agent.interview_history import history_search
+                return history_search(record or {}, **arguments), None
+            from agent.interview_web import web_search, web_extract
+            handler = web_search if name == 'web_search' else web_extract
+            return handler(**arguments), None
+        except Exception:
+            # Do not leak provider/auth/transport diagnostics into a shared chat.
+            return {'error': 'Read-only research unavailable or denied for this scope.'}, None
+    return {'error': 'Denied: tool is not authorized in interview mode.'}, None
 
 
 # POSIX descriptor-relative walking avoids check-then-open symlink races.
@@ -126,9 +148,14 @@ def _read_fd(fd):
 
 
 def _filesystem(name, arguments, roots):
-    path = _absolute(arguments['path'])
     if not isinstance(roots, (list, tuple)) or not roots:
         raise ValueError('No approved roots')
+    raw_path = arguments['path']
+    # Relative references resolve to the explicitly selected first project,
+    # never the gateway working directory. Traversal remains rejected below.
+    if isinstance(raw_path, str) and not Path(raw_path).is_absolute():
+        raw_path = str(_absolute(roots[0]) / raw_path)
+    path = _absolute(raw_path)
     allowed = False
     for raw in roots:
         root = _absolute(raw)
