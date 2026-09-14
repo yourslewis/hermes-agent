@@ -18,7 +18,7 @@ async def deliver_digest(adapter, home, source, now=None):
             with _directory_path(home) as fd:
                 raw, _ = _read('question-learning.json', fd)
             config = json.loads(raw)
-            if (not isinstance(config, dict) or config.get('profile') != 'rex'
+            if (not isinstance(config, dict) or config.get('profile') not in ('rex', 'don')
                     or config.get('owner') != source.user_id or config.get('team') != source.scope_id
                     or source.chat_id not in config.get('channels', [])):
                 return
