@@ -39,7 +39,7 @@ async def adapter_interview_admission(adapter, event):
         rec = controller.store.get(controller.key(event))
         if not rec or rec['phase'] == 'exited':
             # Busy entry is refused, not queued until existing execution ends.
-            if (event.text or '').startswith('/interview'):
+            if (event.text or '').strip().startswith(('/interview', '!interview', '/hermes interview')):
                 from gateway.session import build_session_key
                 lane = build_session_key(event.source,
                     group_sessions_per_user=adapter.config.extra.get('group_sessions_per_user', True),
@@ -109,6 +109,8 @@ class InterviewController:
             return False, None
         key = self.key(event)
         text = (event.text or '').strip()
+        if text == '!interview' or text.startswith('!interview '):
+            text = '/' + text[1:]
         if text.startswith('/hermes interview'):
             text = text[len('/hermes '):]
             text = '/' + text
@@ -123,13 +125,13 @@ class InterviewController:
             return True, None
         if not self.runner._is_user_authorized(event.source) or not event.source.user_id:
             return True, 'Interview access denied.'
+        if active and event.source.user_id != rec['owner']:
+            return True, 'Only the interview owner can answer or change this interview.'
         access_check = getattr(self.runner, '_check_slash_access', None)
         if command and access_check is not None:
             denial = access_check(event.source, 'interview')
             if denial is not None:
                 return True, denial
-        if active and event.source.user_id != rec['owner']:
-            return True, 'Only the interview owner can answer or change this interview.'
         if not event.source.thread_id:
             return True, 'Start /interview inside a Slack thread, so its restrictions have an unambiguous scope.'
         lock = self.locks.setdefault(key, asyncio.Lock())
@@ -142,24 +144,27 @@ class InterviewController:
                 return True, 'Interview turn is in progress. Please retry shortly.'
             if not active:
                 task = text[len('/interview'):].strip()
-                if not task or task in {'status', 'finish', 'resume', 'exit'}:
-                    return True, 'Start with /interview <task> in this thread.'
+                if not task or task.split()[0] in {'status', 'finish', 'resume', 'exit', 'approve-read', 'approve-history'}:
+                    return True, 'Start with !interview [--project /absolute/project --] <task> in this thread.'
                 # Never pretend entering a mode cancels an existing execution.
                 session_key = self.runner._session_key_for_source(event.source)
                 if getattr(self.runner, '_running_agents', {}).get(session_key):
                     return True, 'This thread has active execution. Stop it before starting an interview.'
                 roots = []
-                if task.startswith('--read-root'):
+                if task.startswith('--'):
                     import shlex
                     options, separator, task = task.partition(' -- ')
-                    tokens = shlex.split(options)
-                    if not separator or len(tokens) % 2 or any(tokens[i] != '--read-root' for i in range(0, len(tokens), 2)):
-                        return True, 'Use /interview --read-root "/absolute/project" -- <task>.'
-                    for raw in tokens[1::2]:
-                        root = Path(raw).expanduser()
-                        if not root.is_absolute() or not root.is_dir() or root.is_symlink():
-                            return True, 'Each read root must be an existing absolute directory, not a symlink.'
-                        roots.append(str(root.resolve()))
+                    try:
+                        tokens = shlex.split(options)
+                    except ValueError:
+                        return True, 'Use !interview --project "/absolute/project" -- <task>; close all quotes.'
+                    if not separator or len(tokens) % 2 or any(tokens[i] not in {'--read-root', '--project'} for i in range(0, len(tokens), 2)):
+                        return True, 'Use !interview --project "/absolute/project" -- <task> (--read-root is an alias).'
+                    from gateway.interview_permissions import validate_read_root
+                    try:
+                        roots = list(dict.fromkeys(validate_read_root(raw) for raw in tokens[1::2]))
+                    except ValueError as exc:
+                        return True, str(exc)
                     if not task.strip():
                         return True, 'An interview task is required.'
                 rec = self.store.create(key, event.source.user_id, task, self.bank_loader(), self.source(event))
@@ -171,8 +176,37 @@ class InterviewController:
     async def _active(self, rec, text, command, message_id=None):
         if command:
             control = text[len('/interview'):].strip()
+            action, _, argument = control.partition(' ')
+            if action == 'approve-read':
+                from gateway.interview_permissions import single_argument, validate_read_root
+                try:
+                    root = validate_read_root(single_argument(argument))
+                except ValueError as exc:
+                    return True, str(exc)
+                roots = list(dict.fromkeys(rec.get('read_roots', []) + [root]))
+                pending = rec.get('pending')
+                resolved = (pending and pending.get('kind') == 'read_permission'
+                    and pending.get('path') == root)
+                self.store.update(rec['key'], rec['revision'], read_roots=roots,
+                    **({'pending': None, 'phase': 'paused'} if resolved else {}))
+                return True, f'Read access approved for {root}. Answers retained; continue the interview or use !interview resume.'
+            if action == 'approve-history':
+                from gateway.interview_permissions import single_argument
+                try:
+                    from agent.interview_history import validate_history_session
+                    session_id = validate_history_session(rec, single_argument(argument))
+                except (ValueError, OSError, ImportError) as exc:
+                    return True, f'History access denied: {exc}'
+                sessions = list(dict.fromkeys(rec.get('history_sessions', []) + [session_id]))
+                self.store.update(rec['key'], rec['revision'], history_sessions=sessions)
+                return True, f'History session {session_id} approved. Answers retained; use !interview resume to continue.'
             if control == 'status':
-                return True, f"Interview: {rec['phase']}. Task execution is disabled."
+                roots = ', '.join(rec.get('read_roots', [])) or 'none'
+                sessions = ', '.join(rec.get('history_sessions', [])) or 'none'
+                return True, (f"Interview: {rec['phase']}. Task execution is disabled.\n"
+                    'Capabilities: web search/extraction and current interview search; '
+                    'local reads and prior history only within explicit grants.\n'
+                    f'Read roots: {roots}\nHistory sessions: {sessions}')
             if control == 'exit':
                 self.store.update(rec['key'], rec['revision'], phase='exited', pending=None)
                 return True, 'Interview exited. Nothing was executed; send a separate request to do work.'
@@ -181,14 +215,15 @@ class InterviewController:
                 return True, None
             if control == 'resume' and rec.get('pending'):
                 pending = rec['pending']
-                await self.ask(rec, pending['question'], pending['choices'], kind=pending['kind'])
+                await self.ask(rec, pending['question'], pending['choices'], kind=pending['kind'],
+                    path=pending.get('path'))
                 return True, None
             if control in {'finish', 'resume'}:
                 rec = self.store.update(rec['key'], rec['revision'], pending=None, phase='collecting')
                 await self.advance(rec, 'Summarize requirements and unresolved items now.' if control == 'finish' else 'Resume clarification; ask what needs clarification or revision.',
                     intent='summary' if control == 'finish' else 'collect')
                 return True, None
-            return True, 'Use /interview status, finish, resume, or exit.'
+            return True, 'Use !interview status, finish, resume, exit, approve-read /absolute/project, or approve-history SESSION_ID.'
         if text.startswith('/'):
             if text.split()[0] in {'/stop', '/reset', '/new'}:
                 self.store.update(rec['key'], rec['revision'], pending=None, phase='paused')
@@ -197,6 +232,8 @@ class InterviewController:
         if rec['phase'] in {'awaiting_plan_decision', 'complete', 'plan_complete'}:
             return True, 'Execution remains disabled. Use the planning buttons or /interview resume, finish, or exit.'
         pending = rec.get('pending')
+        if pending and pending['kind'] == 'read_permission':
+            return True, 'Use the owner-bound Approve or Deny read access buttons, or !interview approve-read /absolute/project. Text never grants access.'
         if rec['phase'] == 'awaiting_answer' and pending and text:
             consumed = rec.get('consumed_messages', [])
             if not message_id:
@@ -218,9 +255,26 @@ class InterviewController:
             rec = self.store.get(key)
             if rec is None or rec['owner'] != owner or rec['source']['team'] != team or rec['source']['channel'] != channel or rec['source']['thread'] != thread:
                 return 'Interview answer rejected: wrong owner or conversation.'
+            if rec.get('busy_until', 0) > time.time():
+                return 'Interview is busy; try again.'
             pending = rec.get('pending')
-            if not pending or pending['nonce'] != nonce or pending['message_id'] != message_id or rec['phase'] not in {'awaiting_answer','awaiting_plan_decision'}:
+            if not pending or not message_id or pending['nonce'] != nonce or pending['message_id'] != message_id or rec['phase'] not in {'awaiting_answer','awaiting_plan_decision'}:
                 return 'This interview question is expired or already answered.'
+            if pending['kind'] == 'read_permission':
+                if token not in {'0', '1'}:
+                    return 'Use the owner-bound Approve or Deny read access buttons; text never grants access.'
+                roots = rec.get('read_roots', [])
+                if token == '0':
+                    from gateway.interview_permissions import validate_read_root
+                    try:
+                        root = validate_read_root(pending.get('path'))
+                    except ValueError as exc:
+                        return str(exc)
+                    roots = list(dict.fromkeys(roots + [root]))
+                rec = self.store.update(key, rec['revision'], pending=None, phase='collecting', read_roots=roots)
+                decision = 'approved' if token == '0' else 'denied'
+                await self.advance(rec, f"Owner {decision} read access to {pending['path']}. Continue clarification without executing tasks.")
+                return f'Read access {decision}.'
             if token == 'other':
                 pending = dict(pending, awaiting_text=True)
                 self.store.update(key, rec['revision'], pending=pending)
@@ -265,7 +319,18 @@ class InterviewController:
             model = run_interview_turn
         result = await model(rec, text, intent=intent)
         rec = self.store.update(rec['key'], rec['revision'], messages=result['messages'])
-        if result['kind'] == 'question':
+        if result['kind'] == 'permission':
+            from gateway.interview_permissions import validate_read_root
+            path = validate_read_root(result['path'])
+            reason = result['reason']
+            if not isinstance(reason, str) or not reason.strip() or len(reason) > 32_768:
+                raise ValueError('Invalid interview read permission reason')
+            await self.ask(rec,
+                f"Read permission for interview owner {rec['owner']} only.\n"
+                f"Project directory: {path}\nModel-provided reason: {reason}\n"
+                'Approve bounded read-only access? This does not authorize execution.',
+                ['Approve read access', 'Deny read access'], kind='read_permission', path=path)
+        elif result['kind'] == 'question':
             await self.ask(rec, result['question'], result['choices'])
         else:
             is_plan = intent == 'plan'
@@ -290,9 +355,12 @@ class InterviewController:
         self.store.update(rec['key'], rec['revision'], delivery=None,
             phase='plan_complete' if delivery['kind'] == 'plan' else 'awaiting_plan_decision')
 
-    async def ask(self, rec, question, choices, kind='answer'):
+    async def ask(self, rec, question, choices, kind='answer', *, path=None):
         pending = {'nonce': uuid.uuid4().hex, 'question': question, 'choices': choices,
                    'kind': kind, 'message_id': '', 'awaiting_text': not bool(choices)}
+        if kind == 'read_permission':
+            from gateway.interview_permissions import validate_read_root
+            pending['path'] = validate_read_root(path)
         rec = self.store.update(rec['key'], rec['revision'],
             phase='awaiting_plan_decision' if kind == 'plan' else 'awaiting_answer', pending=pending)
         result = await self.adapter().send_clarify(chat_id=rec['source']['channel'], question=question,
