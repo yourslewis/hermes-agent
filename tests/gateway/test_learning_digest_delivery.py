@@ -29,6 +29,22 @@ async def test_digest_waits_batches_and_acknowledges_only_success(tmp_path):
     assert adapter.send.await_count == 2
 
 @pytest.mark.asyncio
+async def test_digest_does_not_acknowledge_undo_arriving_during_send(tmp_path):
+    from gateway.question_learning_digest import deliver_digest
+    home=tmp_path/'rex'; home.mkdir()
+    (home/'question-learning.json').write_text(json.dumps({'profile':'rex','owner':'U','team':'T','channels':['C']}))
+    with sqlite3.connect(home/'question-learning.sqlite3') as db:
+        db.execute('CREATE TABLE events(event_id TEXT,state TEXT,question_id TEXT,created REAL,delivered INTEGER)')
+        db.execute("INSERT INTO events VALUES('event','added','q',1,0)")
+    async def send(*args,**kwargs):
+        with sqlite3.connect(home/'question-learning.sqlite3') as db:
+            db.execute("UPDATE events SET state='tombstoned',delivered=0")
+        return SimpleNamespace(success=True)
+    await deliver_digest(SimpleNamespace(send=send),home,SimpleNamespace(user_id='U',scope_id='T',chat_id='C',thread_id='th'),now=90000)
+    with sqlite3.connect(home/'question-learning.sqlite3') as db:
+        assert db.execute('SELECT delivered FROM events').fetchone()[0]==0
+
+@pytest.mark.asyncio
 async def test_digest_never_delivers_to_other_author(tmp_path):
     from gateway.question_learning_digest import deliver_digest
     adapter = SimpleNamespace(send=AsyncMock())
