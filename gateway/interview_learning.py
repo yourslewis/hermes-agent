@@ -27,7 +27,7 @@ async def learning_control(home, source, command):
             config = json.loads(raw)
             if not isinstance(config, dict):
                 raise ValueError('Invalid configuration')
-            if (config.get('profile') != 'rex' or config.get('owner') != source.user_id
+            if (config.get('profile') not in ('rex', 'don') or config.get('owner') != source.user_id
                     or config.get('team') != source.scope_id
                     or source.chat_id not in config.get('channels', [])):
                 return 'Question learning access denied.'
@@ -64,7 +64,7 @@ async def capture_learning(adapter, event, source, text):
     home = Path(get_hermes_home())
     if not event.get('user') or event['user'] != source.user_id:
         return  # A thread owner's metadata is not proof of message authorship.
-    if home.name != 'rex' or event.get('_hermes_force_process') or event.get('subtype'):
+    if home.name not in ('rex', 'don') or event.get('_hermes_force_process') or event.get('subtype'):
         return
     if not isinstance(text, str) or not text.strip():
         return
