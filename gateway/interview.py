@@ -75,7 +75,7 @@ async def handle_interview_action(adapter, body, clarify_id, token):
             message.get('thread_ts', ''), message.get('ts', ''))
     except Exception:
         log.exception('Interview action failed; retained restricted state')
-        outcome = 'Interview action failed safely. Use /interview status or resume.'
+        outcome = 'Interview action failed safely. Use !interview status or resume.'
     # Keep status private to the actor; stale/foreign clicks must not rewrite
     # a live card belonging to somebody else.
     await adapter._get_client(channel, team_id=team or None).chat_postEphemeral(
@@ -133,7 +133,7 @@ class InterviewController:
             if denial is not None:
                 return True, denial
         if not event.source.thread_id:
-            return True, 'Start /interview inside a Slack thread, so its restrictions have an unambiguous scope.'
+            return True, 'Start !interview inside a Slack thread, so its restrictions have an unambiguous scope.'
         lock = self.locks.setdefault(key, asyncio.Lock())
         if lock.locked():
             return True, 'Interview turn is in progress. No task execution is enabled; please retry the control after it finishes.'
@@ -161,8 +161,14 @@ class InterviewController:
                     if not separator or len(tokens) % 2 or any(tokens[i] not in {'--read-root', '--project'} for i in range(0, len(tokens), 2)):
                         return True, 'Use !interview --project "/absolute/project" -- <task> (--read-root is an alias).'
                     from gateway.interview_permissions import validate_read_root
+                    paths = [str(Path.home() / raw[2:]) if raw.startswith('~/') else raw
+                             for raw in tokens[1::2]]
+                    if any(not Path(raw).is_absolute() for raw in paths):
+                        return True, ('--project requires an absolute or ~/ project path. For a project name, '
+                            'start !interview <task>, then use !interview approve-read NAME '
+                            'to select a directory and confirm read permission.')
                     try:
-                        roots = list(dict.fromkeys(validate_read_root(raw) for raw in tokens[1::2]))
+                        roots = list(dict.fromkeys(validate_read_root(raw) for raw in paths))
                     except ValueError as exc:
                         return True, str(exc)
                     if not task.strip():
@@ -178,9 +184,21 @@ class InterviewController:
             control = text[len('/interview'):].strip()
             action, _, argument = control.partition(' ')
             if action == 'approve-read':
-                from gateway.interview_permissions import single_argument, validate_read_root
+                from gateway.interview_permissions import single_argument, validate_read_root, resolve_project_candidates
                 try:
-                    root = validate_read_root(single_argument(argument))
+                    raw = single_argument(argument)
+                    if raw.startswith('~/'):
+                        raw = str(Path.home() / raw[2:])
+                    if not Path(raw).is_absolute():
+                        candidates = resolve_project_candidates(raw, read_roots=rec.get('read_roots', []))
+                        if not candidates:
+                            return True, 'No safe project match found. Use !interview approve-read /absolute/project; no access was granted.'
+                        await self.ask(rec,
+                            'Select the exact project directory. Selection does not grant access; '
+                            'a separate read permission confirmation follows.',
+                            candidates, kind='project_choice')
+                        return True, None
+                    root = validate_read_root(raw)
                 except ValueError as exc:
                     return True, str(exc)
                 roots = list(dict.fromkeys(rec.get('read_roots', []) + [root]))
@@ -227,11 +245,15 @@ class InterviewController:
         if text.startswith('/'):
             if text.split()[0] in {'/stop', '/reset', '/new'}:
                 self.store.update(rec['key'], rec['revision'], pending=None, phase='paused')
-                return True, 'Interview paused; restrictions remain. Use /interview resume or exit.'
-            return True, 'That command is disabled during interview mode. Use /interview exit first.'
+                return True, 'Interview paused; restrictions remain. Use !interview resume or exit.'
+            return True, 'That command is disabled during interview mode. Use !interview exit first.'
         if rec['phase'] in {'awaiting_plan_decision', 'complete', 'plan_complete'}:
-            return True, 'Execution remains disabled. Use the planning buttons or /interview resume, finish, or exit.'
+            return True, 'Execution remains disabled. Use the planning buttons or !interview resume, finish, or exit.'
         pending = rec.get('pending')
+        if pending and pending['kind'] == 'budget':
+            return True, 'Use the owner-bound recovery buttons or !interview resume. Text never authorizes planning or execution.'
+        if pending and pending['kind'] == 'project_choice':
+            return True, 'Use the owner-bound project selection buttons or !interview approve-read /absolute/project. Text never grants access.'
         if pending and pending['kind'] == 'read_permission':
             return True, 'Use the owner-bound Approve or Deny read access buttons, or !interview approve-read /absolute/project. Text never grants access.'
         if rec['phase'] == 'awaiting_answer' and pending and text:
@@ -245,7 +267,7 @@ class InterviewController:
                 answers=rec['answers'] + [{'question': pending['question'], 'answer': text}])
             await self.advance(rec, text)
             return True, None
-        return True, 'Interview is paused. Use /interview resume or finish.'
+        return True, 'Interview is paused. Use !interview resume or finish.'
 
     async def accept(self, key, nonce, token, owner, team, channel, thread, message_id):
         lock = self.locks.setdefault(key, asyncio.Lock())
@@ -260,6 +282,28 @@ class InterviewController:
             pending = rec.get('pending')
             if not pending or not message_id or pending['nonce'] != nonce or pending['message_id'] != message_id or rec['phase'] not in {'awaiting_answer','awaiting_plan_decision'}:
                 return 'This interview question is expired or already answered.'
+            if pending['kind'] == 'budget':
+                if token not in {'0', '1', '2'}:
+                    return 'Use the recovery buttons; Other and text never authorize planning or execution.'
+                rec = self.store.update(key, rec['revision'], pending=None,
+                    phase='paused' if token == '2' else 'collecting')
+                if token == '2':
+                    return 'Interview paused. Findings retained; execution remains disabled. Use !interview resume or exit.'
+                await self.advance(rec,
+                    'Continue restricted research from the saved findings.' if token == '0' else
+                    'Summarize what is known, distinguishing unresolved items and incomplete research.',
+                    intent='collect' if token == '0' else 'summary')
+                return 'Recovery choice recorded.'
+            if pending['kind'] == 'project_choice':
+                if token not in {str(i) for i in range(len(pending['choices']))}:
+                    return 'Use the project selection buttons; Other and text never grant access.'
+                from gateway.interview_permissions import validate_read_root
+                try:
+                    path = validate_read_root(pending['choices'][int(token)])
+                except ValueError as exc:
+                    return str(exc)
+                await self.ask_read_permission(rec, path, 'Owner selected this project directory.')
+                return 'Project selected. Read access still requires explicit approval.'
             if pending['kind'] == 'read_permission':
                 if token not in {'0', '1'}:
                     return 'Use the owner-bound Approve or Deny read access buttons; text never grants access.'
@@ -278,7 +322,7 @@ class InterviewController:
             if token == 'other':
                 pending = dict(pending, awaiting_text=True)
                 self.store.update(key, rec['revision'], pending=pending)
-                return 'Type your answer in this thread. For planning, use /interview resume to revise requirements; Other never authorizes planning.'
+                return 'Type your answer in this thread. For planning, use !interview resume to revise requirements; Other never authorizes planning.'
             if not token.isdigit() or int(token) >= len(pending['choices']):
                 return 'Invalid interview answer.'
             answer = pending['choices'][int(token)]
@@ -296,10 +340,10 @@ class InterviewController:
             return 'Answer recorded.'
 
     async def advance(self, rec, text, intent='collect'):
-        rec = self.store.update(rec['key'], rec['revision'], busy_until=time.time() + 150,
+        rec = self.store.update(rec['key'], rec['revision'], busy_until=time.time() + 300,
             phase='planning' if intent == 'plan' else 'collecting')
         try:
-            async with asyncio.timeout(120):
+            async with asyncio.timeout(240):
                 return await self._advance(rec, text, intent)
         except BaseException:
             # Cancellation/timeout/crash never restores ordinary routing.
@@ -319,17 +363,30 @@ class InterviewController:
             model = run_interview_turn
         result = await model(rec, text, intent=intent)
         rec = self.store.update(rec['key'], rec['revision'], messages=result['messages'])
-        if result['kind'] == 'permission':
-            from gateway.interview_permissions import validate_read_root
-            path = validate_read_root(result['path'])
-            reason = result['reason']
-            if not isinstance(reason, str) or not reason.strip() or len(reason) > 32_768:
-                raise ValueError('Invalid interview read permission reason')
+        if result['kind'] == 'budget':
+            rec = self.store.update(rec['key'], rec['revision'],
+                budget={'reason': result['reason'], 'diagnostics': result['diagnostics']})
             await self.ask(rec,
-                f"Read permission for interview owner {rec['owner']} only.\n"
-                f"Project directory: {path}\nModel-provided reason: {reason}\n"
-                'Approve bounded read-only access? This does not authorize execution.',
-                ['Approve read access', 'Deny read access'], kind='read_permission', path=path)
+                'Research reached its iteration or time budget. Findings are saved. '
+                'Choose how to continue; task execution remains disabled.',
+                ['Continue research', 'Summarize what is known', 'Stop here'], kind='budget')
+        elif result['kind'] == 'permission':
+            from gateway.interview_permissions import validate_read_root
+            try:
+                path = validate_read_root(result.get('path'))
+                reason = result.get('reason')
+                if not isinstance(reason, str) or not reason.strip() or len(reason) > 32_768:
+                    raise ValueError('Invalid interview read permission reason')
+            except ValueError:
+                self.store.update(rec['key'], rec['revision'], phase='paused', pending=None)
+                await self.adapter().send_interview_text(chat_id=rec['source']['channel'],
+                    content='Interview paused: the model supplied an invalid read permission request. '
+                    'Saved research is retained; no read access, planning, or execution was authorized. '
+                    'Use !interview approve-read /absolute/project (or a project name), '
+                    'then !interview resume, or !interview finish to summarize what is known.',
+                    metadata=self.metadata(rec))
+                return
+            await self.ask_read_permission(rec, path, f'Model-provided reason: {reason}')
         elif result['kind'] == 'question':
             await self.ask(rec, result['question'], result['choices'])
         else:
@@ -339,6 +396,13 @@ class InterviewController:
                 delivery={'kind': 'plan' if is_plan else 'summary', 'text': text},
                 **({'plan': text, 'phase': 'plan_complete'} if is_plan else {'summary': text, 'phase': 'complete'}))
             await self.deliver_output(rec)
+
+    async def ask_read_permission(self, rec, path, reason):
+        await self.ask(rec,
+            f"Read permission for interview owner {rec['owner']} only.\n"
+            f"Project directory: {path}\n{reason}\n"
+            'Approve bounded read-only access? This does not authorize execution.',
+            ['Approve read access', 'Deny read access'], kind='read_permission', path=path)
 
     async def deliver_output(self, rec):
         # Durable outbox: a crash may duplicate text on resume, but can never
