@@ -172,7 +172,9 @@ def _config(home):
 def _scope(config, source, message_id, internal):
     return (isinstance(source, dict) and not internal and not source.get('internal')
             and not any(source.get(k) for k in ('bot_id', 'is_bot', 'bot', 'subtype'))
-            and config.get('profile') == source.get('profile') == 'rex'
+            # Additional profiles still require their own explicit owner/channel config.
+            and config.get('profile') in ('rex', 'don')
+            and config.get('profile') == source.get('profile')
             and isinstance(config.get('owner'), str) and bool(config['owner'])
             and config['owner'] == source.get('user_id')
             and isinstance(config.get('team'), str) and bool(config['team'])
