@@ -4780,17 +4780,26 @@ class SlackAdapter(BasePlatformAdapter):
         build: Callable[[], Tuple[str, list]], label: str, *,
         resolved: Optional[Dict[Any, bool]] = None, resolved_max: int = 0,
         team_scoped_key: bool = True, sanitize: bool = True,
+        team_scoped_client: Optional[bool] = None,
         extra_kwargs: Optional[Dict[str, Any]] = None) -> SendResult:
         """Shared body of the Block Kit prompt senders: DM-resolve, ``build()`` -> ``(fallback
         text, blocks)``, post, then mark the message unresolved in ``resolved`` (double-click
-        guard). Any failure is logged as ``<label> failed`` and returned, never raised."""
+        guard). Any failure is logged as ``<label> failed`` and returned, never raised.
+
+        ``team_scoped_key`` controls only how the double-click guard is keyed.
+        Client selection is independent: an explicit ``team_id`` in ``metadata``
+        must still win over the channel cache even when the guard uses a bare
+        ts key, so ``team_scoped_client`` defaults to ``team_scoped_key`` but
+        can be set separately.
+        """
         if not self._app:
             return SendResult(success=False, error="Not connected")
         chat_id = await self._dm_target(chat_id, metadata)
         try:
             text, blocks = build()
             result = await self._post_interactive_blocks(
-                chat_id, text, blocks, metadata, sanitize=sanitize, team_scoped=team_scoped_key,
+                chat_id, text, blocks, metadata, sanitize=sanitize,
+                team_scoped=(team_scoped_key if team_scoped_client is None else team_scoped_client),
                 extra_kwargs=extra_kwargs)
             msg_ts = result.get("ts", "")
             if msg_ts and resolved is not None:
@@ -5347,7 +5356,7 @@ class SlackAdapter(BasePlatformAdapter):
             result = await self._send_interactive_prompt(
                 chat_id, metadata, _build, "send_clarify",
                 resolved=self._clarify_resolved, resolved_max=self._CLARIFY_RESOLVED_MAX,
-                team_scoped_key=False, sanitize=False,
+                team_scoped_key=False, team_scoped_client=True, sanitize=False,
                 extra_kwargs={"mrkdwn": False, "parse": "none",
                               "unfurl_links": False, "unfurl_media": False})
         except _ClarifyTooLong as exc:
@@ -5449,14 +5458,34 @@ class SlackAdapter(BasePlatformAdapter):
 
     async def _finalize_interactive_message(
         self, channel_id: str, msg_ts: str, original_text: str, decision_text: str,
-        placeholder: str, label: str, team_id: Optional[str] = None, sanitize: bool = True) -> None:
-        """Rewrite a button prompt to show the outcome and drop the buttons."""
-        updated_blocks = [
-            {"type": "section", "text": {"type": "mrkdwn", "text": original_text or placeholder}},
-            {"type": "context", "elements": [{"type": "mrkdwn", "text": decision_text}]}]
+        placeholder: str, label: str, team_id: Optional[str] = None, sanitize: bool = True,
+        wrap_decision: bool = False) -> None:
+        """Rewrite a button prompt to show the outcome and drop the buttons.
+
+        ``wrap_decision`` renders the outcome as wrapping ≤3000-char plain_text
+        sections (and prepends the question to the fallback ``text``) instead of
+        a single context block, but only when the outcome actually overflows a
+        context block's 3000-char text limit. A selected clarify option can
+        carry the user's full literal choice; short outcomes ("⏳ expired",
+        "✏️ Awaiting typed answer…") keep the plain context-block rendering.
+        """
+        head = original_text or placeholder
+        if wrap_decision and len(decision_text) > 3000:
+            updated_blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": head}}]
+            for start in range(0, len(decision_text), 3000):
+                updated_blocks.append({
+                    "type": "section",
+                    "text": {"type": "plain_text", "text": decision_text[start:start + 3000],
+                             "emoji": False}})
+            fallback = head + "\n\n" + decision_text
+        else:
+            updated_blocks = [
+                {"type": "section", "text": {"type": "mrkdwn", "text": head}},
+                {"type": "context", "elements": [{"type": "mrkdwn", "text": decision_text}]}]
+            fallback = decision_text
         try:
             await self._get_client(channel_id, team_id=team_id).chat_update(
-                channel=channel_id, ts=msg_ts, text=decision_text,
+                channel=channel_id, ts=msg_ts, text=fallback,
                 blocks=sanitize_blocks(updated_blocks) if sanitize else updated_blocks)
         except Exception as e:
             logger.warning("[Slack] Failed to update %s message: %s", label, e)
@@ -5556,7 +5585,8 @@ class SlackAdapter(BasePlatformAdapter):
         self, channel_id: str, msg_ts: str, question_text: str, decision_text: str) -> None:
         """Rewrite a clarify message to show the outcome and drop the buttons."""
         await self._finalize_interactive_message(
-            channel_id, msg_ts, question_text, decision_text, "Clarification", "clarify", sanitize=False
+            channel_id, msg_ts, question_text, decision_text, "Clarification", "clarify",
+            sanitize=False, wrap_decision=True
         )
 
     async def retire_clarify_card(self, clarify_id: str, notice: str) -> None:
@@ -5585,6 +5615,12 @@ class SlackAdapter(BasePlatformAdapter):
             logger.warning("[Slack] Malformed clarify value: %s", value)
             return
         clarify_id, token = value.split("|", 1)
+        # Interview cards survive restart and own their replay/identity checks.
+        # Route before the process-local ordinary-clarify double-click guard.
+        if clarify_id.startswith("iv:"):
+            from gateway.interview import handle_interview_action
+            await handle_interview_action(self, body, clarify_id, token)
+            return
         # Double-click guard — atomic pop (mirrors approval).
         if self._clarify_resolved.pop(msg_ts, True):
             return
