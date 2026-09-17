@@ -6593,11 +6593,24 @@ class SlackAdapter(BasePlatformAdapter):
             # 4 (+ Other = 5) so this is normally one block, but chunk anyway
             # so a larger choice list degrades gracefully instead of 400ing.
             elements = []
+            option_blocks = []
+            option_texts = []
             for idx, choice in enumerate(choices):
                 label = str(choice).strip() or f"Option {idx + 1}"
+                key = chr(ord("A") + idx)
+                option_text = f"{key}. {label}"
+                option_texts.append(option_text)
+                # Buttons truncate on narrow clients. Keep the original option
+                # in wrapping plain text, not mrkdwn that could hide link text.
+                for start in range(0, len(option_text), 3000):
+                    option_blocks.append({
+                        "type": "section",
+                        "expand": True,
+                        "text": {"type": "plain_text", "text": option_text[start:start + 3000], "emoji": False},
+                    })
                 elements.append({
                     "type": "button",
-                    "text": {"type": "plain_text", "text": label[:75], "emoji": True},
+                    "text": {"type": "plain_text", "text": f"Choose {key}", "emoji": True},
                     "action_id": f"hermes_clarify_choice_{idx}",
                     "value": f"{clarify_id}|{idx}",
                 })
@@ -6610,13 +6623,23 @@ class SlackAdapter(BasePlatformAdapter):
 
             blocks: list = [
                 {"type": "section", "text": {"type": "mrkdwn", "text": body}},
+                *option_blocks,
             ]
             for start in range(0, len(elements), 5):
                 blocks.append({"type": "actions", "elements": elements[start:start + 5]})
 
+            # Never silently truncate an option to fit Slack's message limits.
+            fallback_options = "\n\n".join(option_texts).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            fallback_text = body + "\n\n" + fallback_options
+            if len(blocks) > 50 or len(fallback_text) > 35000:
+                return SendResult(success=False, error="Clarification options are too long for one Slack card; ask a smaller question.")
             kwargs: Dict[str, Any] = {
                 "channel": chat_id,
-                "text": body,
+                "text": fallback_text,
+                "mrkdwn": False,
+                "parse": "none",
+                "unfurl_links": False,
+                "unfurl_media": False,
                 "blocks": blocks,
             }
             if thread_ts:
@@ -6991,16 +7014,19 @@ class SlackAdapter(BasePlatformAdapter):
                 "type": "section",
                 "text": {"type": "mrkdwn", "text": question_text or "Clarification"},
             },
-            {
-                "type": "context",
-                "elements": [{"type": "mrkdwn", "text": decision_text}],
-            },
         ]
+        # A selected option can exceed a context block's text limit too.
+        # Preserve its literal full text using wrapping sections on update.
+        for start in range(0, len(decision_text), 3000):
+            updated_blocks.append({
+                "type": "section",
+                "text": {"type": "plain_text", "text": decision_text[start:start + 3000], "emoji": False},
+            })
         try:
             await self._get_client(channel_id).chat_update(
                 channel=channel_id,
                 ts=msg_ts,
-                text=decision_text,
+                text=(question_text or "Clarification") + "\n\n" + decision_text,
                 blocks=updated_blocks,
             )
         except Exception as e:
