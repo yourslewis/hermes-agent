@@ -171,6 +171,9 @@ def contains_launchctl_submit_command(command: str) -> bool:
 
 
 def _resolve_terminal_script_path(candidate: str, cwd: Optional[str]) -> Path:
+    # Path() rejects NUL bytes with ValueError. Callers feed this untrusted
+    # command text, so strip rather than raise out of the guard.
+    candidate = candidate.replace("\x00", "")
     path = Path(candidate).expanduser()
     if not path.is_absolute():
         path = Path(cwd or Path.cwd()) / path
@@ -267,6 +270,13 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
         os.close(descriptor)
     if len(data) > _MAX_REFERENCED_SCRIPT_BYTES:
         return None, True
+    # Strip NUL bytes before decoding. A NUL-bearing file is usually a binary
+    # (e.g. the interpreter named on the command line), whose decoded garbage
+    # the caller re-parses as shell -- yielding bogus NUL-bearing "paths" that
+    # crash Path.resolve(). We must NOT skip the file: that would let a crafted
+    # script hide `hermes gateway restart` behind a NUL. Removing the NULs
+    # keeps the content scannable while making it path-safe.
+    data = data.replace(b"\x00", b"")
     return data.decode("utf-8", errors="replace"), False
 
 
@@ -298,7 +308,10 @@ def _contains_unsafe_gateway_action(
     for script_path in _iter_referenced_shell_scripts(command, cwd=cwd):
         try:
             resolved = script_path.resolve(strict=False)
-        except OSError:
+        except (OSError, ValueError):
+            # ValueError: path contains a NUL byte. This happens when a prior
+            # recursion decoded a binary file (e.g. the interpreter named on
+            # the command line) and parsed garbage "paths" out of it.
             resolved = script_path
         if resolved in visited:
             continue

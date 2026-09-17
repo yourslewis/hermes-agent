@@ -628,6 +628,39 @@ class TestLifecycleGuardModule:
         with pytest.raises(GatewayLifecycleBlocked):
             check_gateway_lifecycle("", str(script))
 
+    def test_nul_bytes_do_not_hide_lifecycle_command(self, tmp_path):
+        """NUL bytes are stripped, not used to skip the file -- otherwise a
+        crafted script could hide the command behind a NUL."""
+        from cron.lifecycle_guard import GatewayLifecycleBlocked, check_gateway_lifecycle
+        script = tmp_path / "sneaky.sh"
+        script.write_bytes(b"\x00hermes gateway restart\x00")
+        with pytest.raises(GatewayLifecycleBlocked):
+            check_gateway_lifecycle("", str(script))
+
+    def test_interpreter_argument_does_not_crash_guard(self, tmp_path):
+        """Regression: `python3 /path/script.py` made the guard read the
+        *interpreter binary* as a referenced script, re-parse its decoded bytes
+        as shell, and build Paths containing NUL -- Path.resolve() then raised
+        ValueError('embedded null byte'), so every such command died before
+        running instead of being allowed."""
+        import sys
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script as check,
+        )
+        script = tmp_path / "harmless.py"
+        script.write_text("print('hi')\n")
+        assert check(f"{sys.executable} {script}", cwd=str(tmp_path)) is False
+
+    def test_binary_referenced_script_still_scanned_not_skipped(self, tmp_path):
+        """The NUL fix must not turn binaries into an unscanned blind spot."""
+        from cron.lifecycle_guard import _read_referenced_script
+        script = tmp_path / "blob.bin"
+        script.write_bytes(b"\x7fELF\x00\x00hermes gateway restart\x00")
+        text, unsafe = _read_referenced_script(script)
+        assert unsafe is False
+        assert text is not None and "\x00" not in text
+        assert "hermes gateway restart" in text
+
 
     def test_relative_script_resolved_under_scripts_dir(self, tmp_path, monkeypatch):
         """A bare/relative script name resolves under HERMES_HOME/scripts (the
