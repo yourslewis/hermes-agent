@@ -53,6 +53,20 @@ export function ptyReconnectDelayMs(attempt: number): number {
 // repainted, while under-running it re-opens the blank-viewport bug.
 export const PTY_RESUME_SANITIZE_WINDOW_MS = 30000
 
+// A WebSocket can stay in readyState OPEN after a mobile app switch, radio
+// handoff, or tab restore even though the TCP path underneath is dead: no
+// `onclose` ever fires, so the resume check below sees OPEN and the viewer
+// sits on a frozen terminal forever. Recycle an apparently-open socket when
+// the tab was backgrounded for longer than the threshold. The server-side PTY
+// is unaffected and `?attach=` replays the scrollback, so a needless reconnect
+// costs a repaint, while skipping a needed one costs the session.
+//
+// Mobile is aggressive (a radio handoff invalidates sockets in well under a
+// second of background); desktop is conservative, where a brief tab switch
+// almost never kills a healthy socket.
+export const PTY_MOBILE_OPEN_SOCKET_RECONNECT_AFTER_MS = 1500
+export const PTY_DESKTOP_OPEN_SOCKET_RECONNECT_AFTER_MS = 30000
+
 export interface PtyResumeReconnectInput {
   isActive: boolean
   visibilityState?: DocumentVisibilityState
@@ -62,6 +76,12 @@ export interface PtyResumeReconnectInput {
   connectInFlight?: boolean
   /** The automatic ladder used its last attempt; only the explicit Reconnect button restarts it. */
   reconnectGaveUp?: boolean
+  /** `performance.now()`-style timestamp of when the tab was last hidden, or null if never. */
+  hiddenAtMs?: number | null
+  /** Injectable clock for tests; defaults to `Date.now()`. */
+  nowMs?: number
+  /** Mobile/tablet UA: radios invalidate sockets far faster than a desktop tab switch. */
+  mobileLike?: boolean
 }
 
 const WS_CONNECTING = 0
@@ -76,7 +96,10 @@ export function shouldReconnectPtyOnPageResume({
   socketReadyState,
   ptyState,
   connectInFlight,
-  reconnectGaveUp
+  reconnectGaveUp,
+  hiddenAtMs,
+  nowMs,
+  mobileLike
 }: PtyResumeReconnectInput): boolean {
   if (!isActive || !online || visibilityState === 'hidden') {
     return false
@@ -90,6 +113,20 @@ export function shouldReconnectPtyOnPageResume({
     return false
   }
   if (socketReadyState === WS_OPEN) {
+    // OPEN is normally healthy, so the default stays "don't reconnect". The
+    // exception is a socket that survived a long background interval: see
+    // PTY_MOBILE_OPEN_SOCKET_RECONNECT_AFTER_MS. Without a hidden timestamp
+    // there is nothing to measure, so fall through to the original behaviour.
+    const hiddenAt = typeof hiddenAtMs === 'number' ? hiddenAtMs : null
+    if (hiddenAt !== null) {
+      const elapsed = (nowMs ?? Date.now()) - hiddenAt
+      const threshold = mobileLike
+        ? PTY_MOBILE_OPEN_SOCKET_RECONNECT_AFTER_MS
+        : PTY_DESKTOP_OPEN_SOCKET_RECONNECT_AFTER_MS
+      if (elapsed >= threshold) {
+        return true
+      }
+    }
     return false
   }
   // A connect is mid-flight (the async socket-open IIFE is awaiting its
