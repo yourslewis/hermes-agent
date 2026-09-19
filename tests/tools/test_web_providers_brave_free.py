@@ -90,7 +90,34 @@ class TestBraveFreeProviderSearch:
         assert captured["headers"].get("X-Subscription-Token") == "BSAkey123"
         assert captured["params"].get("q") == "q"
         assert captured["params"].get("count") == 5
+        # extra_snippets is a Pro-tier parameter; free-tier keys simply get no
+        # such field back, so requesting it unconditionally is safe.
+        assert captured["params"].get("extra_snippets") == "true"
 
+    def test_extra_snippets_passed_through_when_present(self, monkeypatch):
+        """Pro-tier extra_snippets are forwarded on the rows that carry them."""
+        monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "BSAkey123")
+        from plugins.web.brave_free.provider import BraveFreeWebSearchProvider
+
+        payload = {
+            "web": {
+                "results": [
+                    {
+                        "title": "A", "url": "https://a.example.com", "description": "desc A",
+                        "extra_snippets": ["snip one", "snip two"],
+                    },
+                    {"title": "B", "url": "https://b.example.com", "description": "desc B"},
+                ]
+            }
+        }
+        with patch("httpx.get", return_value=self._mock_resp(payload)):
+            result = BraveFreeWebSearchProvider().search("q", limit=5)
+
+        web = result["data"]["web"]
+        assert web[0]["extra_snippets"] == ["snip one", "snip two"]
+        # Absent on the free tier / when Brave omits it: the key stays out
+        # entirely rather than being emitted as an empty list.
+        assert "extra_snippets" not in web[1]
 
     def test_missing_web_key_returns_empty(self, monkeypatch):
         """Responses without a ``web`` block should produce an empty result set, not crash."""

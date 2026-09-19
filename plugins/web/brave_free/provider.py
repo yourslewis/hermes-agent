@@ -30,14 +30,27 @@ class BraveFreeWebSearchProvider(BaseWebSearchProvider):
             return search_fail("BRAVE_SEARCH_API_KEY is not set")
         data, failure = http_get_json(
             "Brave Search", _BRAVE_ENDPOINT,
-            params={"q": query, "count": max(1, min(int(limit), 20))},  # Brave caps count at 20
+            params={
+                "q": query,
+                "count": max(1, min(int(limit), 20)),  # Brave caps count at 20
+                "extra_snippets": "true",
+            },
             headers={"X-Subscription-Token": api_key, "Accept": "application/json"},
             timeout=15, logger=logger,
         )
         if failure is not None:
             return failure
         raw_results = (data.get("web") or {}).get("results", []) or []
-        web_results = titled_rows(raw_results[:limit], "description")
+        truncated = raw_results[:limit]
+        web_results = titled_rows(truncated, "description")
+        # Paid-tier (Pro) parameter: several extra excerpt paragraphs per result.
+        # Absent on the free tier / when Brave omits it, so the key is only added
+        # when non-empty to keep payloads lean. ``titled_rows`` is shared with
+        # other providers, so the passthrough is merged here rather than there.
+        for row, raw in zip(web_results, truncated):
+            extra = raw.get("extra_snippets")
+            if extra:
+                row["extra_snippets"] = [str(s) for s in extra]
         logger.info("Brave Search '%s': %d results (from %d raw, limit %d)", query, len(web_results), len(raw_results), limit)
         return search_ok(web_results)
 
