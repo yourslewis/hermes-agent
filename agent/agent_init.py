@@ -370,11 +370,80 @@ _EXPLICIT_API_MODES = {
 }
 
 
+def _resolve_declared_api_mode(agent, *, model: str) -> Optional[str]:
+    """Resolve ``model.api_mode_map`` for ``model``, or None if not configured.
+
+    Returns None when the running config declares no ``api_mode_map`` at all,
+    which preserves the legacy inference chain for configs that predate this
+    feature.  When a map *is* declared it is authoritative and strict: an
+    unknown model raises ``ApiModeConfigError`` rather than falling back, so
+    adding a model upstream cannot silently regress tool calling.
+
+    The resolved value is cached on ``agent._api_mode_map`` so runtime model
+    switches re-resolve against the same validated mapping.
+    """
+    try:
+        from hermes_cli.api_mode_map import (
+            ApiModeConfigError,
+            normalize_api_mode_map,
+            resolve_api_mode,
+        )
+    except Exception:  # pragma: no cover - import guard only
+        return None
+
+    cached = getattr(agent, "_api_mode_map", None)
+    config_path = getattr(agent, "_config_path", None)
+
+    if cached is None:
+        # NOTE: this runs early in init_agent — before the config is loaded
+        # into agent state further down — so load it directly rather than
+        # reading an attribute that does not exist yet.
+        raw_cfg = getattr(agent, "_agent_config", None)
+        if not isinstance(raw_cfg, dict):
+            try:
+                from hermes_cli.config import load_config_readonly
+
+                raw_cfg = load_config_readonly()
+            except Exception:  # pragma: no cover - config load guard
+                return None
+        if not isinstance(raw_cfg, dict):
+            return None
+        model_cfg = raw_cfg.get("model")
+        if not isinstance(model_cfg, dict):
+            return None
+        if "api_mode_map" not in model_cfg:
+            # Legacy config — keep provider/hostname inference intact.
+            return None
+        cached = normalize_api_mode_map(
+            model_cfg.get("api_mode_map"),
+            config_path=config_path,
+            legacy_api_mode=model_cfg.get("api_mode"),
+        )
+        agent._api_mode_map = cached
+
+    if not cached:
+        return None
+
+    try:
+        return resolve_api_mode(model, cached, config_path=config_path)
+    except ApiModeConfigError:
+        raise
+
+
 def _resolve_api_mode(agent, api_mode, provider_name, base_url):
     """Set ``agent.api_mode`` (and provider rewrites) — ordered ladder, first match wins."""
     from hermes_cli.providers import is_actual_route
     host, url = agent._base_url_hostname, agent._base_url_lower
-    if is_actual_route(agent.provider, base_url):
+    # Per-model declaration (model.api_mode_map) outranks every inference below.
+    # Hostname/provider-name inference cannot see the model, so it silently
+    # mis-routes multi-family endpoints (LiteLLM, Copilot passthroughs, in-house
+    # gateways): an Anthropic model reached through an OpenAI-compatible URL
+    # falls through to chat_completions and receives OpenAI-shaped tool schemas,
+    # degrading tool calling instead of erroring. See hermes_cli/api_mode_map.
+    _declared_api_mode = _resolve_declared_api_mode(agent, model=getattr(agent, "model", "") or "")
+    if _declared_api_mode:
+        agent.api_mode = _declared_api_mode
+    elif is_actual_route(agent.provider, base_url):
         agent.api_mode = "chat_completions"
     elif api_mode in _EXPLICIT_API_MODES:
         agent.api_mode = api_mode
