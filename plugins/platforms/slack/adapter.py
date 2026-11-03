@@ -993,6 +993,90 @@ def _extra_or_env_channel_set_getter(
     return getter
 
 
+# --- /model picker labels: enrich model names with context window + $/1M ---
+# Local metadata file (model_picker_meta.json, repo root) maps proxy aliases to
+# {in, out, ctx} from official vendor pricing pages. It lives next to the source
+# tree (not in any profile's config) so it survives profile resets; a gateway
+# restart picks up changes to it. Absent/corrupt file → labels fall back to the
+# bare model id (original behavior).
+import os as _os
+
+_MODEL_META_CACHE: dict = {"loaded": False, "models": {}}
+
+
+def _load_model_meta() -> dict:
+    if _MODEL_META_CACHE["loaded"]:
+        return _MODEL_META_CACHE["models"]
+    _MODEL_META_CACHE["models"] = {}
+    try:
+        root = _os.path.abspath(__file__)
+        for _ in range(4):  # adapter.py → slack/ → platforms/ → plugins/ → repo root
+            root = _os.path.dirname(root)
+        path = _os.path.join(root, "model_picker_meta.json")
+        if _os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as fh:
+                _MODEL_META_CACHE["models"] = (json.load(fh) or {}).get("models") or {}
+    except Exception:
+        _MODEL_META_CACHE["models"] = {}
+    _MODEL_META_CACHE["loaded"] = True
+    return _MODEL_META_CACHE["models"]
+
+
+def _fmt_ctx(n) -> str:
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return ""
+    if n >= 1_000_000:
+        v = n / 1_000_000
+        if v < 10:  # round to nearest whole M for small values (1.05M -> 1M)
+            v = round(v)
+            if v > 0:
+                return f"{int(v)}M"
+        return f"{int(v)}M" if v == int(v) else f"{v:.1f}M"
+    if n >= 1000:
+        v = n / 1000
+        if v == int(v):
+            return f"{int(v)}K"
+        v1024 = n / 1024
+        if v1024 == int(v1024):  # e.g. 131072 -> 128K
+            return f"{int(v1024)}K"
+        return f"{v:.0f}K"
+    return str(n)
+
+
+def _fmt_price(v) -> str:
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return ""
+    if v == int(v):
+        return f"${int(v)}"
+    if v < 1:
+        return f"${v:g}"
+    return f"${v:g}"
+
+
+def _model_picker_label(short: str) -> str:
+    """Model id + ' · 272K ctx · $0.10/$0.50 per 1M' (best-effort, ≤75 chars)."""
+    meta = _load_model_meta().get(short)
+    if not isinstance(meta, dict):
+        return short
+    parts = []
+    ctx = _fmt_ctx(meta.get("ctx"))
+    if ctx:
+        parts.append(f"{ctx} ctx")
+    pin, pout = _fmt_price(meta.get("in")), _fmt_price(meta.get("out"))
+    if pin and pout:
+        parts.append(f"{pin}/{pout} per 1M")
+    elif pin == "0" and pout == "0":
+        parts.append("self-hosted, free")
+    if not parts:
+        return short
+    label = f"{short} · {' · '.join(parts)}"
+    return label[:75]
+
+
 class SlackAdapter(BasePlatformAdapter):
     """Slack bot adapter (Socket Mode).
     Needs SLACK_BOT_TOKEN (xoxb-, API calls) and SLACK_APP_TOKEN (xapp-, Socket Mode). DMs +
@@ -4877,6 +4961,8 @@ class SlackAdapter(BasePlatformAdapter):
 
         return await self._send_interactive_prompt(chat_id, metadata, _build, "send_slash_confirm")
 
+
+
     def _build_model_picker_provider_blocks(
         self, providers: list, current_model: str, provider_label: str
     ) -> List[dict]:
@@ -4944,7 +5030,7 @@ class SlackAdapter(BasePlatformAdapter):
         for idx, model_id in enumerate(models):
             short = model_id.split("/")[-1] if "/" in model_id else model_id
             options.append({
-                "text": {"type": "plain_text", "text": short[:75], "emoji": True},
+                "text": {"type": "plain_text", "text": _model_picker_label(short)[:75], "emoji": True},
                 "value": str(idx),
             })
         total = (provider or {}).get("total_models", len(models))
