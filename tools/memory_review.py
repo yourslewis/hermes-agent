@@ -281,7 +281,7 @@ def prepare(payload, provenance=None):
             if not isinstance(op, dict):
                 raise ValueError("Malformed operation")
             act = op.get("action")
-            content = (op.get("content") or "").strip()
+            content = (op.get("content") or op.get("new_text") or "").strip()
             old = (op.get("old_text") or "").strip()
             if act not in {"add", "replace", "remove"}:
                 raise ValueError("Unknown operation")
