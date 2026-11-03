@@ -84,6 +84,11 @@ def handle_pending_subcommand(
     if sub == "pending":
         return _fmt_pending_list(subsystem)
 
+    if sub == "review" and subsystem == wa.MEMORY:
+        from tools.memory_review import read, review_text
+        rec = read(rest[0]) if len(rest) == 1 else None
+        return review_text(rec) if rec and "review" in rec else "Usage: /memory review <id>"
+
     if sub in {"approve", "apply"}:
         return _approve(subsystem, rest, memory_store)
 
@@ -139,6 +144,8 @@ def _approve(subsystem: str, rest: List[str], memory_store) -> str:
 
 
 def _apply_one(subsystem: str, rec, memory_store):
+    if subsystem == wa.MEMORY and "review" in rec:
+        return False, "Use the authenticated private review card; text approval cannot bypass its binding."
     payload = rec.get("payload", {})
     try:
         if subsystem == wa.MEMORY:
@@ -162,9 +169,14 @@ def _reject(subsystem: str, rest: List[str]) -> str:
     if target.lower() == "all":
         n = 0
         for rec in wa.list_pending(subsystem):
+            if subsystem == wa.MEMORY and "review" in rec:
+                continue
             if wa.discard_pending(subsystem, rec["id"]):
                 n += 1
         return f"Rejected {n} pending {subsystem} write(s)."
+    rec = wa.get_pending(subsystem, target)
+    if subsystem == wa.MEMORY and rec and "review" in rec:
+        return "Use the authenticated private review card to reject this proposal."
     if wa.discard_pending(subsystem, target):
         return f"Rejected pending {subsystem} write '{target}'."
     return f"No pending {subsystem} write with id '{target}'."

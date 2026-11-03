@@ -2071,6 +2071,8 @@ class SlackAdapter(BasePlatformAdapter):
                 )
                 await self._handle_slash_command(command)
 
+            self._register_memory_review_actions()
+
             # Register Block Kit action handlers for approval buttons
             for _action_id in (
                 "hermes_approve_once",
@@ -2162,6 +2164,7 @@ class SlackAdapter(BasePlatformAdapter):
                 self._start_socket_mode_handler()
                 self._running = True
                 self._ensure_socket_watchdog()
+                self._start_memory_review_delivery()
             except Exception:
                 self._running = False
                 try:
@@ -2218,6 +2221,44 @@ class SlackAdapter(BasePlatformAdapter):
             if lock_acquired and not self._running:
                 self._release_platform_lock()
 
+    def _memory_review_service(self):
+        from tools.memory_review import MemoryReview, settings, enabled
+        if not enabled():
+            return None
+        # No _get_client fallback: an unknown workspace must fail closed.
+        client = self._team_clients.get(settings().get("team_id"))
+        return MemoryReview(client) if client is not None else None
+
+    def _register_memory_review_actions(self):
+        for action in ("approve", "reject", "defer"):
+            self._app.action("hermes_memory_" + action)(self._handle_memory_review_action)
+
+    async def _handle_memory_review_action(self, ack, body, **kwargs):
+        await ack()
+        service = self._memory_review_service()
+        if service is None:
+            return
+        try:
+            await service.callback(body)
+        except Exception:
+            # Never include proposal contents or callback payload in logs.
+            logger.warning("Private memory review callback refused or failed", exc_info=False)
+
+    def _start_memory_review_delivery(self):
+        from tools.memory_review import attach_delivery
+        service = self._memory_review_service()
+        if service is None:
+            return
+        attach_delivery(service, asyncio.get_running_loop())
+        async def recover_outbox():
+            while self._running:
+                try:
+                    await service.flush()
+                except Exception:
+                    logger.warning("Private memory review outbox failed; recover with /memory")
+                await asyncio.sleep(5)
+        self._memory_review_task = asyncio.create_task(recover_outbox())
+
     async def create_handoff_thread(
         self,
         parent_chat_id: str,
@@ -2263,6 +2304,15 @@ class SlackAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         """Disconnect from Slack."""
+        from tools.memory_review import detach_delivery
+        detach_delivery()
+        task = getattr(self, "_memory_review_task", None)
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
         self._running = False
 
         watchdog_task = self._socket_watchdog_task

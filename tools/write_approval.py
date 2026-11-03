@@ -129,6 +129,11 @@ def stage_write(subsystem: str, payload: Dict[str, Any],
     logs and still returns a record (the write is simply lost, which is the
     safe failure for an approval gate — nothing is silently committed).
     """
+    review = None
+    if subsystem == MEMORY:
+        from tools.memory_review import enabled, prepare, _trigger_context
+        if enabled():
+            review = prepare(payload, _trigger_context.get())
     pid = uuid.uuid4().hex[:8]
     record = {
         "id": pid,
@@ -139,6 +144,34 @@ def stage_write(subsystem: str, payload: Dict[str, Any],
         "created_at": time.time(),
         "payload": payload,
     }
+    if review is not None:
+        record.update(review=review, status="Pending", notification_id=str(uuid.uuid4()))
+        from tools.memory_review import journal_lock, save, bound_record
+        with journal_lock():
+            for existing in list_pending(MEMORY):
+                # Scope authorization precedes duplicate/conflict content access.
+                if not bound_record(existing):
+                    continue
+                prior = existing.get("review")
+                if not prior or prior["target"] != review["target"]:
+                    continue
+                if prior["before_raw"] == review["before_raw"] and prior["after_raw"] == review["after_raw"]:
+                    from tools.memory_review import digest
+                    for trigger in review["triggers"]:
+                        if trigger not in prior["triggers"]:
+                            prior["triggers"].append(trigger)
+                    prior["binding"] = digest({k: v for k, v in prior.items() if k != "binding"})
+                    existing["card_dirty"] = bool(existing.get("delivery"))
+                    save(existing)
+                    return existing
+                old_targets = {c["before"] for c in prior["changes"] if c["before"]}
+                new_targets = {c["before"] for c in review["changes"] if c["before"]}
+                if old_targets & new_targets:
+                    raise ValueError("Conflicting pending proposal targets the same entry")
+            save(record)
+        from tools.memory_review import notify_staged
+        notify_staged()
+        return record
     try:
         d = _pending_dir(subsystem)
         d.mkdir(parents=True, exist_ok=True)
@@ -151,7 +184,7 @@ def stage_write(subsystem: str, payload: Dict[str, Any],
     return record
 
 
-def list_pending(subsystem: str) -> List[Dict[str, Any]]:
+def list_pending(subsystem: str, *, include_decided=False) -> List[Dict[str, Any]]:
     """Return all pending records for ``subsystem``, oldest first."""
     d = _pending_dir(subsystem)
     if not d.exists():
@@ -159,7 +192,9 @@ def list_pending(subsystem: str) -> List[Dict[str, Any]]:
     records: List[Dict[str, Any]] = []
     for p in d.glob("*.json"):
         try:
-            records.append(json.loads(p.read_text(encoding="utf-8")))
+            record = json.loads(p.read_text(encoding="utf-8"))
+            if include_decided or record.get("status", "Pending") in {"Pending", "Deferred", "applying"}:
+                records.append(record)
         except Exception:
             logger.warning("Skipping unreadable pending record: %s", p)
     records.sort(key=lambda r: r.get("created_at", 0))
@@ -168,6 +203,9 @@ def list_pending(subsystem: str) -> List[Dict[str, Any]]:
 
 def get_pending(subsystem: str, pending_id: str) -> Optional[Dict[str, Any]]:
     """Return a single pending record by id, or None."""
+    import re
+    if subsystem not in _SUBSYSTEMS or not isinstance(pending_id, str) or not re.fullmatch(r"[a-f0-9]{8,32}", pending_id):
+        return None
     path = _pending_dir(subsystem) / f"{pending_id}.json"
     if not path.exists():
         return None
@@ -179,6 +217,8 @@ def get_pending(subsystem: str, pending_id: str) -> Optional[Dict[str, Any]]:
 
 def discard_pending(subsystem: str, pending_id: str) -> bool:
     """Delete a pending record. Returns True if it existed."""
+    if get_pending(subsystem, pending_id) is None:
+        return False
     path = _pending_dir(subsystem) / f"{pending_id}.json"
     try:
         if path.exists():
@@ -191,6 +231,8 @@ def discard_pending(subsystem: str, pending_id: str) -> bool:
 
 def pending_count(subsystem: str) -> int:
     """Cheap count of pending records (for notification badges)."""
+    if subsystem == MEMORY:
+        return len(list_pending(subsystem))
     d = _pending_dir(subsystem)
     if not d.exists():
         return 0
@@ -273,6 +315,11 @@ def evaluate_gate(subsystem: str, *, inline_summary: str = "",
     """
     if not write_approval_enabled(subsystem):
         return GateDecision(allow=True)
+
+    if subsystem == MEMORY:
+        from tools.memory_review import enabled
+        if enabled():
+            return GateDecision(stage=True, message="Staged for private review; not yet saved. Use /memory to recover.")
 
     background = is_background()
 
