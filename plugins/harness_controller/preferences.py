@@ -58,10 +58,10 @@ class HarnessPreferenceStore:
             return {}
 
     def _config_default(self, key: str = "default") -> dict[str, Any]:
-        config_path = self.root.parent / "config.yaml"
         try:
-            import yaml
-            data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+            from hermes_cli.config import load_config_readonly
+
+            data = load_config_readonly()
         except Exception:
             return {}
         harness_cfg = (data.get("harness") or {}) if isinstance(data, dict) else {}
