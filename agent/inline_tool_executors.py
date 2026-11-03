@@ -113,6 +113,7 @@ def _session_search(agent, args: dict, ctx: InlineToolContext) -> Any:
 
 
 def _memory(agent, args: dict, ctx: InlineToolContext) -> Any:
+    from tools.memory_review import attributed_triggers
     result = _call_tool(
         "tools.memory_tool", "memory_tool", args,
         (
@@ -120,6 +121,7 @@ def _memory(agent, args: dict, ctx: InlineToolContext) -> Any:
             ("old_text", "old_text"), ("new_text", "new_text"), ("operations", "operations"),
         ),
         store=agent._memory_store,
+        provenance=attributed_triggers(agent, args.get("source_refs")),
     )
     # Mirror built-in memory writes to external providers; gating lives in
     # MemoryManager.notify_memory_tool_write.

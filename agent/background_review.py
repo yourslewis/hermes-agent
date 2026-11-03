@@ -683,6 +683,10 @@ def summarize_background_review_actions(
         # ``success``/``_change``.
         if not isinstance(data, dict) or not data.get("success"):
             continue
+        if data.get("staged"):
+            from tools.memory_review import enabled
+            if enabled():
+                continue
         actions.extend(_action_lines(data, call_details.get(tcid) or {}, verbose))
     return actions
 
@@ -930,6 +934,12 @@ def build_cache_parity_fork(
     if not _routed and write_origin == "background_review":
         _warn_ignored_reasoning_effort(agent, task_cfg)
     review_agent = AIAgent(**_fork_init_kwargs(agent, _rt, _routed, max_iterations, task_cfg))
+    import copy
+    from tools.memory_review import _source_context
+    captured_sources = _source_context.get()
+    if captured_sources is None:
+        captured_sources = getattr(agent, "_memory_review_sources", {})
+    review_agent._memory_review_sources = copy.deepcopy(captured_sources)
     review_agent._memory_write_origin = review_agent._memory_write_context = write_origin
     review_agent._memory_store = agent._memory_store
     review_agent._memory_enabled = agent._memory_enabled
@@ -1091,6 +1101,7 @@ def _run_review_fork(
     so the caller's error path still sees usage and the fork to clean up. ``explicit`` (/refine)
     keeps the ``background_review`` origin (curator/skill guards still apply) but marks the fork
     attended, so the unattended-only memory delete gate leaves the full operation set available."""
+    from tools.memory_review import source_instructions
     st.review_agent, _rt, _routed = build_cache_parity_fork(
         agent, task_cfg, max_iterations=_REVIEW_MAX_ITERATIONS)
     st.review_agent._review_attended = explicit
@@ -1122,7 +1133,8 @@ def _run_review_fork(
             # Routed -> digest (cache cold anyway); same model -> full snapshot (warm cache reads).
             st.review_agent.run_conversation(
                 user_message=(
-                    prompt + "\n\nYou can only call " + memory_phrase_prompt +
+                    prompt + source_instructions(st.review_agent)
+                    + "\n\nYou can only call " + memory_phrase_prompt +
                     "management tools. Other tools will be denied "
                     "at runtime — do not attempt them." + prompt_extra
                 ),
@@ -1267,10 +1279,23 @@ def spawn_background_review_thread(
             f"focus — prioritize it over the general instructions above:\n{focus}"
         )
 
+    from tools.memory_review import agent_triggers, proposal_context, _source_context
+    import copy
+    frozen_sources = copy.deepcopy(getattr(agent, "_memory_review_sources", {}))
+    frozen_triggers = agent_triggers(agent)
+
     def _target() -> None:  # resolves _run_review_in_thread at call time (tests patch it)
-        _run_review_in_thread(
-            agent, messages_snapshot, prompt, task_cfg=task_cfg, review_run=review_run,
-            review_memory=review_memory, explicit=explicit)
+        from tools.skill_provenance import set_current_write_origin, reset_current_write_origin
+        origin_token = set_current_write_origin("background_review")
+        source_token = _source_context.set(frozen_sources)
+        try:
+            with proposal_context(frozen_triggers):
+                _run_review_in_thread(
+                    agent, messages_snapshot, prompt, task_cfg=task_cfg, review_run=review_run,
+                    review_memory=review_memory, explicit=explicit)
+        finally:
+            _source_context.reset(source_token)
+            reset_current_write_origin(origin_token)
 
     return _target, prompt
 

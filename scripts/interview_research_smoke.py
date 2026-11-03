@@ -11,7 +11,7 @@ from agent.interview_runtime import run_interview_turn, LEGACY_SYSTEM_PROMPT
 async def main():
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory).resolve()
-        (root / 'schema.txt').write_text('Synthetic activity fields: event_id, timestamp, user_id')
+        (root / 'schema.txt').write_text('Synthetic activity fields: event_id, timestamp, user_id', encoding='utf-8')
         record = {'id': 'synthetic-research', 'owner': 'synthetic',
             'task': 'Clarify a synthetic event processing system', 'bank': {},
             'source': {}, 'read_roots': [str(root)], 'messages': [

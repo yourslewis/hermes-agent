@@ -864,6 +864,21 @@ class GatewaySlashCommandsMixin(
         from hermes_cli.write_approval_commands import handle_pending_subcommand
         from tools import write_approval as wa
         from tools.memory_tool import load_on_disk_store
+        from tools.memory_review import enabled, recover_command
+        if enabled() or any("review" in rec for rec in wa.list_pending(wa.MEMORY, include_decided=True)):
+            adapter = self._adapter_for_source(event.source)
+            service_factory = getattr(adapter, "_memory_review_service", None)
+            if service_factory is None:
+                return "Use the configured private memory review DM."
+            service = service_factory()
+            if service is None:
+                return "Private review workspace is unavailable; no memory disclosed."
+            raw = event.raw_message if isinstance(event.raw_message, dict) else {}
+            team = getattr(event.source, "scope_id", None) or raw.get("team_id") or raw.get("team")
+            if isinstance(team, dict):
+                team = team.get("id")
+            return await recover_command(service, event.source.user_id, team, event.source.chat_id, event.get_command_args().strip().split())
+
         # Apply approved writes against a fresh on-disk store (the gateway has no long-lived agent;
         # the store persists to the same MEMORY/USER.md and honors the configured char limits).
         out = handle_pending_subcommand(

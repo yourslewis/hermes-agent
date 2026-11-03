@@ -1979,6 +1979,8 @@ class GatewayTurnMixin:
         from gateway.run import _load_gateway_config
         _was_auto_reset, _is_new_session = await self._hmwa_open_session(session_entry, session_key, source)
         context = build_session_context(source, self.config, session_entry)
+        from tools.memory_review import bind_session
+        bind_session(session_entry.session_id)
         # Session context variables for tools (task-local, concurrency-safe)
         _session_env_tokens = self._set_session_env(context)
         # Self-injected turns (MessageEvent(internal=True)) persist with a DB-only display_kind so
