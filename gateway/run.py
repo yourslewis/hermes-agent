@@ -13695,6 +13695,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         source = event.source
 
+        from tools.memory_review import bind_ingress
+        bind_ingress(event)
+
         # 🔴 Cross-session leak guard. This handler runs inside a per-message
         # asyncio task created via create_task(), which snapshots the spawning
         # context with copy_context(). If a *concurrent* message had already
@@ -15776,6 +15779,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         # Build session context
         context = build_session_context(source, self.config, session_entry)
+        # Freeze the actual ingress before async review/overlapping turns. Never
+        # recover evidence from the review fork's synthetic user instruction.
+        from tools.memory_review import bind_session
+        bind_session(session_entry.session_id)
         
         # Set session context variables for tools (task-local, concurrency-safe)
         _session_env_tokens = self._set_session_env(context)

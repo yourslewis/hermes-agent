@@ -1051,6 +1051,7 @@ def memory_tool(
     old_text: str = None,
     operations: Optional[List[Dict[str, Any]]] = None,
     store: Optional[MemoryStore] = None,
+    provenance=None,
 ) -> str:
     """
     Single entry point for the memory tool. Dispatches to MemoryStore methods.
@@ -1062,6 +1063,10 @@ def memory_tool(
 
     Returns JSON string with results.
     """
+    if provenance is not None:
+        from tools.memory_review import proposal_context
+        with proposal_context(provenance):
+            return memory_tool(action, target, content, old_text, operations, store)
     if store is None:
         return tool_error("Memory is not available. It may be disabled in config or this environment.", success=False)
 
@@ -1078,7 +1083,10 @@ def memory_tool(
     if operations:
         if not isinstance(operations, list):
             return tool_error("operations must be a list of {action, content?, old_text?} objects.", success=False)
-        gate_result = _apply_batch_write_gate(target, operations)
+        try:
+            gate_result = _apply_batch_write_gate(target, operations)
+        except (ValueError, OSError, RuntimeError) as exc:
+            return tool_error(f"Memory proposal not staged: {exc}", success=False)
         if gate_result is not None:
             return gate_result
         result = store.apply_batch(target, operations)
@@ -1103,7 +1111,10 @@ def memory_tool(
 
     # Approval gate: when on, stages the write (background/gateway) or prompts
     # inline (interactive CLI); when off (default) passes straight through.
-    gate_result = _apply_write_gate(action, target, content, old_text)
+    try:
+        gate_result = _apply_write_gate(action, target, content, old_text)
+    except (ValueError, OSError, RuntimeError) as exc:
+        return tool_error(f"Memory proposal not staged: {exc}", success=False)
     if gate_result is not None:
         return gate_result
 
@@ -1193,6 +1204,10 @@ MEMORY_SCHEMA = {
             "old_text": {
                 "type": "string",
                 "description": "REQUIRED for 'replace' and 'remove' (single-op shape): a short unique substring identifying the existing entry to modify. Omit only for 'add'."
+            },
+            "source_refs": {
+                "type": "array", "items": {"type": "string"},
+                "description": "Runtime source IDs of the originating user turns supporting this proposal. Use only supplied IDs, never quotes or invented IDs.",
             },
             "operations": {
                 "type": "array",

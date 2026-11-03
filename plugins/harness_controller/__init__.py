@@ -32,12 +32,10 @@ _preferences: dict[str, dict[str, str]] = {}
 
 
 def _load_profile_config() -> dict[str, Any]:
-    config_path = Path(get_hermes_home()) / "config.yaml"
     try:
-        import yaml
+        from hermes_cli.config import load_config_readonly
 
-        data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-        return data if isinstance(data, dict) else {}
+        return load_config_readonly()
     except Exception:
         return {}
 
@@ -225,7 +223,12 @@ def _tool_harness_run(args: dict | None = None, **_: Any) -> str:
         output = "Hermes is the active/default harness for this profile. No external worker command was launched."
         updated = _run_store.record_result(run.run_id, exit_code=0, output=output)
         return json.dumps({"success": True, "run": asdict(updated), "command": spec.argv, "output": output})
-    proc = subprocess.run(spec.argv, cwd=spec.cwd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=int(args.get("timeout") or 600))
+    proc = subprocess.run(
+        spec.argv, cwd=spec.cwd, stdin=subprocess.DEVNULL,
+        text=True, encoding="utf-8", errors="replace",
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        timeout=int(args.get("timeout") or 600),
+    )
     updated = _run_store.record_result(run.run_id, exit_code=proc.returncode, output=proc.stdout or "")
     return json.dumps({"success": proc.returncode == 0, "run": asdict(updated), "command": spec.argv, "output": (proc.stdout or "")[-4000:]})
 

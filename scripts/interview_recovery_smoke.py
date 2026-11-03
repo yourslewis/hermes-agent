@@ -19,7 +19,7 @@ async def main():
         assert record['read_roots'] == []
         print(json.dumps({'kind': result['kind'], 'permission_granted': False}))
         record.update(messages=result['messages'], read_roots=[str(root)])
-        (root / 'schema.txt').write_text('Synthetic fields: event_id, user_id, timestamp')
+        (root / 'schema.txt').write_text('Synthetic fields: event_id, user_id, timestamp', encoding='utf-8')
         next_turn = await run_interview_turn(record,
             'The owner approved the project. Read schema.txt, then ask one question about latency; do not execute.')
         assert next_turn['kind'] == 'question', next_turn['kind']

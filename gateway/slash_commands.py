@@ -3444,6 +3444,21 @@ class GatewaySlashCommandsMixin:
         session_key = self._session_key_for_source(event.source)
         config_path = _hermes_home / "config.yaml"
 
+        from tools.memory_review import enabled, recover_command
+        if enabled() or any("review" in rec for rec in wa.list_pending(wa.MEMORY, include_decided=True)):
+            adapter = self._adapter_for_source(event.source)
+            service_factory = getattr(adapter, "_memory_review_service", None)
+            if service_factory is None:
+                return "Use the configured private memory review DM."
+            service = service_factory()
+            if service is None:
+                return "Private review workspace is unavailable; no memory disclosed."
+            raw = event.raw_message if isinstance(event.raw_message, dict) else {}
+            team = getattr(event.source, "scope_id", None) or raw.get("team_id") or raw.get("team")
+            if isinstance(team, dict):
+                team = team.get("id")
+            return await recover_command(service, event.source.user_id, team, event.source.chat_id, args)
+
         def _set_approval(enabled: bool):
             # Write-back round-trip: raw read is correct (merged defaults must
             # not be persisted back to the user's file).

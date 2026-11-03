@@ -77,6 +77,41 @@ def test_harness_run_tool_with_hermes_default_does_not_spawn_external_command(tm
     assert "No external worker command" in result["output"]
 
 
+def test_harness_run_child_has_closed_stdin_and_utf8_output(tmp_path, monkeypatch):
+    import subprocess
+    import sys
+    from types import SimpleNamespace
+
+    import plugins.harness_controller as hc
+    from plugins.harness_controller.preferences import HarnessPreferenceStore
+    from plugins.harness_controller.run_registry import HarnessRunStore
+
+    monkeypatch.setattr(hc, "_pref_store", HarnessPreferenceStore(tmp_path / "cfg"))
+    monkeypatch.setattr(hc, "_run_store", HarnessRunStore(tmp_path / "runs"))
+    argv = [sys.executable, "-c",
+            "import sys; assert sys.stdin.read() == ''; "
+            "sys.stdout.buffer.write('你好'.encode('utf-8') + b'\\xff')"]
+    monkeypatch.setattr(hc, "build_harness_command", lambda **kw: SimpleNamespace(
+        argv=argv, cwd=str(tmp_path), harness="codex"))
+    real_run = subprocess.run
+
+    def run_child(*args, **kwargs):
+        assert kwargs.get("stdin") == subprocess.DEVNULL
+        assert kwargs.get("encoding") == "utf-8"
+        assert kwargs.get("errors") == "replace"
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(hc.subprocess, "run", run_child)
+    result = json.loads(hc._tool_harness_run({"goal": "Read fixture", "timeout": 10}))
+
+    assert result["success"] is True
+    assert result["output"] == "你好\ufffd"
+    persisted = hc._run_store.load(result["run"]["run_id"])
+    assert persisted.state == "completed"
+    transcript = hc._run_store.run_dir(persisted.run_id) / "transcript.jsonl"
+    assert json.loads(transcript.read_text(encoding="utf-8"))["text"] == result["output"]
+
+
 def test_harness_controller_registers_harness_toolset_tools(tmp_path, monkeypatch):
     from hermes_cli.plugins import PluginManager
     from model_tools import get_tool_definitions

@@ -504,7 +504,7 @@ def summarize_background_review_actions(
         # Defensively normalize everything through a dict-typed alias so
         # the rest of the function can stay terse without per-call
         # ``isinstance`` guards (#59437).
-        if not isinstance(data, dict) or not data.get("success"):
+        if not isinstance(data, dict) or not data.get("success") or data.get("staged"):
             continue
         message = data.get("message", "")
         detail = call_details.get(tcid) or {}
@@ -662,7 +662,9 @@ def _run_review_in_thread(
     via ``agent._safe_print`` and ``agent.background_review_callback``.
     """
     # Local import to avoid a hard circular dep at module load.
+    import copy
     from run_agent import AIAgent
+    from tools.memory_review import source_instructions
     from tools.terminal_tool import set_approval_callback as _set_approval_callback
 
     # Install a non-interactive approval callback on this worker
@@ -762,6 +764,11 @@ def _run_review_in_thread(
                 skip_memory=True,
                 **_fork_kwargs,
             )
+            from tools.memory_review import _source_context
+            captured_sources = _source_context.get()
+            if captured_sources is None:
+                captured_sources = getattr(agent, "_memory_review_sources", {})
+            review_agent._memory_review_sources = copy.deepcopy(captured_sources)
             review_agent._memory_write_origin = "background_review"
             review_agent._memory_write_context = "background_review"
             # The review fork pins the parent's cached system prompt and keeps
@@ -887,6 +894,7 @@ def _run_review_in_thread(
                 review_agent.run_conversation(
                     user_message=(
                         prompt
+                        + source_instructions(review_agent)
                         + "\n\nYou can only call memory and skill "
                         "management tools. Other tools will be denied "
                         "at runtime — do not attempt them."
@@ -1011,8 +1019,22 @@ def spawn_background_review_thread(
     else:
         prompt = getattr(agent, "_SKILL_REVIEW_PROMPT", _SKILL_REVIEW_PROMPT)
 
+    from tools.memory_review import agent_triggers, proposal_context
+    import copy
+    from tools.memory_review import _source_context
+    frozen_sources = copy.deepcopy(getattr(agent, "_memory_review_sources", {}))
+    frozen_triggers = agent_triggers(agent)
+
     def _target() -> None:
-        _run_review_in_thread(agent, messages_snapshot, prompt)
+        from tools.skill_provenance import set_current_write_origin, reset_current_write_origin
+        token = set_current_write_origin("background_review")
+        source_token = _source_context.set(frozen_sources)
+        try:
+            with proposal_context(frozen_triggers):
+                _run_review_in_thread(agent, messages_snapshot, prompt)
+        finally:
+            _source_context.reset(source_token)
+            reset_current_write_origin(token)
 
     return _target, prompt
 
