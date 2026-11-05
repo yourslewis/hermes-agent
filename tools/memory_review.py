@@ -155,13 +155,22 @@ def bind_session(session_id):
         _trigger_context.set(triggers)
 
 
-def canonical_blocks(blocks):
-    """Ignore only Slack-generated IDs/defaults; preserve all reviewed content."""
+def canonical_blocks(blocks, *, slack_escape=False):
+    """Ignore Slack IDs/defaults; optionally encode expected plain-text transport.
+
+    Encode the expected text once, rather than decoding both sides: literal
+    entity strings must remain distinguishable from their decoded characters.
+    Button values and other binding fields are never transformed.
+    """
     if isinstance(blocks, list):
-        return [canonical_blocks(item) for item in blocks]
+        return [canonical_blocks(item, slack_escape=slack_escape) for item in blocks]
     if isinstance(blocks, dict):
-        return {key: canonical_blocks(value) for key, value in blocks.items()
-                if key != "block_id" and not (key == "emoji" and value is True)}
+        result = {key: canonical_blocks(value, slack_escape=slack_escape)
+                  for key, value in blocks.items()
+                  if key != "block_id" and not (key == "emoji" and value is True)}
+        if slack_escape and blocks.get("type") == "plain_text" and isinstance(result.get("text"), str):
+            result["text"] = result["text"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        return result
     return blocks
 
 
@@ -475,8 +484,10 @@ class MemoryReview:
         response = await self.client.conversations_history(channel=delivery["channel"],
             latest=delivery["ts"], inclusive=True, limit=1)
         messages = response.get("messages") or []
+        actual = canonical_blocks(messages[0].get("blocks")) if messages else None
+        expected = render(rec)
         return bool(response.get("ok") and messages and messages[0].get("ts") == delivery["ts"]
-                    and canonical_blocks(messages[0].get("blocks")) == canonical_blocks(render(rec)))
+                    and actual == canonical_blocks(expected, slack_escape=True))
 
     async def update_card(self, rec):
         key = (asyncio.get_running_loop(), profile_key(), rec["id"])
