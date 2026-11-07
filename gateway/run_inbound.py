@@ -1297,6 +1297,8 @@ class GatewayInboundMixin:
             # handles the turn itself; carry its reply back out to the caller.
             return getattr(event, "_interview_response", None)
         event, source, is_internal = _admitted
+        from tools.memory_review import bind_ingress
+        bind_ingress(event)
         # TERMINAL-DECLINE LATCH TEARDOWN. Deliberately placed AFTER admission,
         # not on the adapter's raw inbound: profile routing, the ignored-channel
         # guard, plugin hooks and user authorization all reject events above,

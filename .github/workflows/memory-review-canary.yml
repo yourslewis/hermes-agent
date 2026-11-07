@@ -1,0 +1,25 @@
+name: Memory review regression
+on:
+  push:
+    branches: [fix/memory-card-slack-escaping]
+  pull_request:
+    paths:
+      - tools/memory_review.py
+      - tests/tools/test_memory_review*.py
+      - .github/workflows/memory-review-canary.yml
+permissions:
+  contents: read
+jobs:
+  memory-review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39
+        with:
+          version: "0.9.28"
+      - run: uv sync --frozen --extra dev
+      - name: Run private memory review regressions
+        env:
+          HERMES_HOME: ${{ runner.temp }}/memory-review-home
+        run: uv run python -m pytest tests/tools/test_memory_review*.py -q

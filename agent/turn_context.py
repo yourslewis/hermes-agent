@@ -598,6 +598,16 @@ def _stage_turn_user_message(
     # recovery dedups via ``has_platform_message_id`` against this row.
     if persist_user_platform_id is not None:
         user_msg["platform_message_id"] = persist_user_platform_id
+    # Append only to the new turn; never mutate the cached prefix/history.
+    from tools.memory_review import remember_turn, source_instructions
+    remember_turn(agent, expected_persist_content,
+                  synthetic=bool(persist_user_display_kind) or getattr(agent, "_memory_write_context", None) == "background_review")
+    source_note = source_instructions(agent)
+    if source_note and isinstance(user_msg.get("content"), str):
+        user_msg["content"] += source_note
+        user_msg["api_content"] = user_msg["content"]
+        if persist_user_message is None:
+            agent._persist_user_message_override = expected_persist_content
     return user_msg, pending_cli_message
 
 

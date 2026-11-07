@@ -2,6 +2,11 @@ name: Tests
 
 on:
   workflow_call:
+    inputs:
+      slice_count:
+        description: Number of parallel file-isolated test slices
+        type: number
+        default: 8
 
 permissions:
   contents: read
@@ -12,17 +17,36 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  generate:
+    name: Generate test slices
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Restore per-file duration cache
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: test_durations.json
+          key: test-durations-standard-never-exact
+          restore-keys: |
+            test-durations-standard-
+      - name: Generate test slices
+        id: matrix
+        run: |
+          MATRIX=$(python3 scripts/run_tests_parallel.py --generate-slices ${{ inputs.slice_count }})
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+
   test:
-    name: Run tests
-    # One 96-core runner for the whole suite. There is no slicing. Slicing
-    # existed to spread the suite over 4-core runners. It cost a matrix job, a
-    # duration cache, a per-slice artifact and a merge job to do it.
-    #
-    # 96 cores clear the floor that the slowest single test file sets (about
-    # 82s). A second slice divides work that is already at that floor, and
-    # adds a second setup.
-    runs-on: ubuntu-latest-96-core
+    name: Run tests slice ${{ matrix.slice.index }}/${{ inputs.slice_count }}
+    needs: generate
+    runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.generate.outputs.matrix) }}
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -99,56 +123,83 @@ jobs:
         uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: test_durations.json
-          key: test-durations-never-exact
+          key: test-durations-standard-never-exact
           restore-keys: |
-            test-durations-
+            test-durations-standard-
 
       - name: Run tests
         # Per-file isolation via scripts/run_tests.sh: each test file runs
         # in its own freshly-spawned `python -m pytest <file>` subprocess
         # with bounded parallelism. No xdist, no shared workers, no
         # module-level state leakage between files.
-        #
-        # No --files: the runner discovers the suite itself. The discovered
-        # set is identical to the list the removed matrix job used to pass in.
         run: |
           source .venv/bin/activate
-          scripts/run_tests.sh
+          scripts/run_tests.sh --files "$TEST_FILES"
         env:
-          # This is the maximum number of test FILES that run together.
-          # run_tests_parallel.py starts one pytest subprocess for each file
-          # from a single ThreadPoolExecutor, so this value IS the limit. The
-          # default is cpu_count*2, which is 192 here.
-          #
-          # Measured on this runner (96-core EPYC 7763, 377GB). Whole suite,
-          # two repetitions for each value. See run 32549672063:
-          #
-          #     workers   x cores   mean
-          #        48       0.5x    138s
-          #        96       1.0x    126s   <- fastest
-          #       144       1.5x    132s
-          #       192       2.0x    132s
-          #       240       2.5x    140s
-          #       288       3.0x    142s
-          #
-          # One worker for each core wins. The curve is shallow: 126s to 142s
-          # across a 6x range. The suite has sufficient concurrency at this
-          # size. The remaining time is the slowest files plus the setup.
-          # Workers above the core count only add contention.
-          HERMES_TEST_WORKERS: 96
+          # Matrix values are data, never interpolated into shell source.
+          TEST_FILES: ${{ matrix.slice.files }}
+          # Bound memory and CPU contention on standard hosted runners.
+          HERMES_TEST_WORKERS: 2
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
 
+      - name: Prepare per-slice durations
+        if: always()
+        env:
+          TEST_FILES: ${{ matrix.slice.files }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          source = Path('test_durations.json')
+          durations = json.loads(source.read_text()) if source.exists() else {}
+          selected = set(os.environ['TEST_FILES'].split(':'))
+          Path('slice-durations').mkdir(exist_ok=True)
+          Path('slice-durations/test_durations.json').write_text(
+              json.dumps({key: value for key, value in durations.items() if key in selected}))
+          PY
+
+      - name: Upload per-slice durations
+        # Advisory only; test failures remain blocking.
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-durations-slice-${{ matrix.slice.index }}
+          path: slice-durations/test_durations.json
+          retention-days: 1
+
+  save-durations:
+    needs: test
+    if: needs.test.result == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download slice durations separately
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: test-durations-slice-*
+          path: durations
+      - name: Merge per-file durations
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          merged = {}
+          for path in sorted(Path('durations').glob('*/test_durations.json')):
+              merged.update(json.loads(path.read_text()))
+          if not merged:
+              raise SystemExit('No per-file durations downloaded')
+          Path('test_durations.json').write_text(json.dumps(merged, sort_keys=True))
+          print(f'Merged {len(merged)} file durations')
+          PY
       - name: Save per-file duration cache (main only)
-        # Only green first-attempt durations are written by the runner, so
-        # a hang on main cannot ratchet its own bound upward.
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && hashFiles('test_durations.json') != ''
         uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: test_durations.json
-          key: test-durations-${{ github.run_id }}
+          key: test-durations-standard-${{ github.run_id }}
 
   e2e:
     runs-on: ubuntu-latest

@@ -23,6 +23,6 @@ bank=load_notes_bank(a.notes_root,cache_path=cache)
 data=dict(enabled=True,profile='rex',owner=a.owner,team=a.team,channels=a.channel,
     since=f'{time.time():.6f}',notes_root=str(a.notes_root),cache_path=str(cache))
 fd=os.open(config,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
-with os.fdopen(fd,'w') as stream:
+with os.fdopen(fd,'w',encoding='utf-8') as stream:
     json.dump(data,stream,indent=2);stream.flush();os.fsync(stream.fileno())
 print('Configured new-message learning; validated questions:',len(bank['questions']))
