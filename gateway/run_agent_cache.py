@@ -439,6 +439,9 @@ class GatewayAgentCacheMixin:
         Returns the post-bump generation."""
         from contextvars import copy_context
         from gateway.run import _AGENT_PENDING_SENTINEL, _reap_gateway_turn_processes, request_hard_interrupt
+        from tools.approval import unregister_gateway_notify
+        # Includes idle background delegates whose originating foreground already returned.
+        unregister_gateway_notify(session_key)
         state = self._peek_session_state(session_key)
         running_agent = state.turn.agent if state else None
         _process_task_id, _process_baseline = "", None

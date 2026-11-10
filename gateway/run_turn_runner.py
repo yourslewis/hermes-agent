@@ -1449,6 +1449,13 @@ class TurnRunner:
         from gateway.run_turn_runner_approval_settle import register_timeout_notice
         ctx = self._ctx
         adapter = ctx._status_adapter
+        origin = approval_data.get("_origin_route")
+
+        async def dispatch(send):
+            if origin is not None:
+                return await origin.dispatch(send, approval_data.get("request_id"))
+            return await send()
+
         # Slack's assistant_threads_setStatus disables the compose box, so the user can't type
         # /approve while "is thinking..." shows. Pausing stops _keep_typing re-setting it; resumed
         # in approve/deny.
@@ -1463,10 +1470,10 @@ class TurnRunner:
         if _renders_exec_approval_buttons(type(adapter)):
             try:
                 fut = self._schedule(
-                    adapter.send_exec_approval(
+                    dispatch(lambda: adapter.send_exec_approval(
                         chat_id=ctx._status_chat_id, command=cmd, session_key=ctx.session_key or "",
                         description=desc, metadata=ctx._status_thread_metadata, **flags,
-                    ),
+                    )),
                     "send_exec_approval scheduling error",
                 )
                 if fut is None:
@@ -1529,7 +1536,7 @@ class TurnRunner:
             # Mark as approval prompt so WeCom routes through the control lane.
             metadata = {**(ctx._status_thread_metadata or {}), "is_approval_prompt": True}
             fut = self._schedule(
-                adapter.send(ctx._status_chat_id, msg, metadata=_interim_metadata(metadata)), "Approval text-send scheduling error",
+                dispatch(lambda: adapter.send(ctx._status_chat_id, msg, metadata=_interim_metadata(metadata))), "Approval text-send scheduling error",
             )
             if fut is not None:
                 fut.result(timeout=15)
@@ -1676,7 +1683,7 @@ class TurnRunner:
         """Run the turn with the per-session gateway approval callback registered: dangerous-command
         approval blocks the agent thread (mirrors CLI input()); the callback bridges sync→async."""
         from gateway.run import _wrap_current_message_with_observed_context
-        from tools.approval import register_gateway_notify, unregister_gateway_notify
+        from tools.approval import gateway_approval_origin, register_gateway_notify, unregister_gateway_notify
         from tools.approval_context import reset_current_session_key, set_current_session_key
         ctx = self._ctx
         session_key = ctx.session_key or ""
@@ -1708,10 +1715,12 @@ class TurnRunner:
             if ctx.inbound_message_id is not None:
                 kwargs["persist_user_platform_id"] = str(ctx.inbound_message_id)
             from agent.notification_presentation import notification_turn
-            with notification_turn(agent, muted=ctx.mute_notification_reply, session_id=ctx.session_id or ""):
+            with gateway_approval_origin(session_key, self._approval_notify_sync), notification_turn(
+                agent, muted=ctx.mute_notification_reply, session_id=ctx.session_id or "",
+            ):
                 return agent.run_conversation(api_message, **kwargs)
         finally:
-            unregister_gateway_notify(session_key)
+            unregister_gateway_notify(session_key, preserve_origin=True, expected_cb=self._approval_notify_sync)
             # Cancel pending clarify entries so blocked agent threads don't hang past the end of the
             # run (interrupt, completion, gateway shutdown). Idempotent.
             with suppress(Exception):
