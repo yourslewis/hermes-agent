@@ -171,10 +171,15 @@ def _background_delete_gate(action, operations, target="memory", content=None, o
 
 def memory_tool(action: str = None, target: str = "memory", content: str = None, old_text: str = None,
                 new_text: str = None, operations: Optional[List[Dict[str, Any]]] = None,
-                store: Optional[MemoryStore] = None) -> str:
+                store: Optional[MemoryStore] = None, provenance=None) -> str:
     """Tool entry point; returns a JSON string. Single op (action + content/old_text)
     or batch (``operations``, atomic against the final budget). ``new_text``
     aliases ``content`` — callers mirror ``old_text`` with it (patch-tool shape)."""
+    if provenance is not None:
+        from tools.memory_review import proposal_context
+        with proposal_context(provenance):
+            return memory_tool(action=action, target=target, content=content, old_text=old_text,
+                               new_text=new_text, operations=operations, store=store)
     if store is None:
         return tool_error("Memory is not available. It may be disabled in config or this environment.", success=False)
     if content is None and new_text is not None:
@@ -191,15 +196,21 @@ def memory_tool(action: str = None, target: str = "memory", content: str = None,
         if denied is not None:
             return denied
         # Approval gate: stages (background/gateway) or prompts inline (CLI); off by default.
-        gate_result = _apply_write_gate("batch", target, None, None, operations)
+        try:
+            gate_result = _apply_write_gate("batch", target, None, None, operations)
+        except (ValueError, OSError, RuntimeError) as exc:
+            return tool_error(f"Memory proposal not staged: {exc}", success=False)
         if gate_result is not None:
             return gate_result
         return json.dumps(store.apply_batch(target, operations), ensure_ascii=False)
     if action not in _STORE_ACTIONS:
         return tool_error(f"Unknown action '{action}'. Use: add, replace, remove", success=False)
-    invalid = (_validate_single_op(store, action, target, content, old_text)
-               or _background_delete_gate(action, None, target, content, old_text)
-               or _apply_write_gate(action, target, content, old_text))
+    try:
+        invalid = (_validate_single_op(store, action, target, content, old_text)
+                   or _background_delete_gate(action, None, target, content, old_text)
+                   or _apply_write_gate(action, target, content, old_text))
+    except (ValueError, OSError, RuntimeError) as exc:
+        return tool_error(f"Memory proposal not staged: {exc}", success=False)
     if invalid is not None:
         return invalid
     return json.dumps(_STORE_ACTIONS[action][0](store, target, content, old_text), ensure_ascii=False)
@@ -309,6 +320,10 @@ MEMORY_SCHEMA = {
             "new_text": {
                 "type": "string",
                 "description": "Alias for 'content' (single-op shape). Provided so the replace/remove old_text/new_text pairing works; if both are set, 'content' wins."
+            },
+            "source_refs": {
+                "type": "array", "items": {"type": "string"},
+                "description": "Runtime source IDs of the originating user turns supporting this proposal. Use only supplied IDs, never quotes or invented IDs.",
             },
             "operations": {
                 "type": "array",

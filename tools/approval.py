@@ -11,7 +11,10 @@ Leaves read facade-owned state (``_lock``, queues, denial breaker) back through 
 call time; sibling-defined names are imported from their defining module.
 """
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
+import weakref
 import hashlib
 import importlib
 import logging
@@ -48,6 +51,29 @@ _YOLO_MODE_FROZEN: bool = is_truthy_value(os.getenv("HERMES_YOLO_MODE", ""))
 # --- Per-session approval state (thread-safe) -----------------------------------------------------------------------
 
 _lock = threading.Lock()
+# Serialize consent commits with teardown, separately from the queue/dispatch lock.
+# Persistence may block: contenders fail after a bounded wait, and teardown must
+# raise rather than report completion while an admitted commit is still running.
+_consent_commit_lock = threading.RLock()
+_CONSENT_COMMIT_TIMEOUT = 5.0
+
+
+@contextmanager
+def _consent_transaction():
+    if not _consent_commit_lock.acquire(timeout=_CONSENT_COMMIT_TIMEOUT):
+        raise TimeoutError("approval consent commit did not finish before teardown")
+    try:
+        yield
+    finally:
+        _consent_commit_lock.release()
+
+
+class _SessionGeneration:
+    pass
+
+
+# Only in-flight decisions retain generations; idle session keys do not accumulate.
+_session_generations = weakref.WeakValueDictionary()
 _pending: dict[str, dict] = {}
 _session_approved: dict[str, set] = {}
 _session_yolo: set[str] = set()
@@ -126,11 +152,108 @@ def register_gateway_notify(session_key: str, cb) -> None:
         _gateway_notify_cbs[session_key] = cb
 
 
-def unregister_gateway_notify(session_key: str) -> None:
-    """Unregister the callback and wake ALL blocked threads for this session so
-    they don't hang forever (agent run finished or interrupted)."""
+class _GatewayOriginRoute:
+    """Revocable origin capability, retained only by live copied execution contexts."""
+    def __init__(self, session_key, notify):
+        self.session_key = session_key
+        self.notify = notify
+
+    def __call__(self, data):
+        with _lock:
+            notify = self.notify
+        if notify is None:
+            raise RuntimeError("origin approval route was closed")
+        notify({**data, "_origin_route": self})
+
+    async def dispatch(self, send, request_id=None):
+        """Linearize send start against revoke; never hold _lock across an await.
+
+        Already-started I/O is cancelled best-effort and may have reached the platform.
+        A dispatch that has not started at revocation cannot call the adapter.
+        """
+        import asyncio
+        task = asyncio.current_task()
+        with _lock:
+            if self.notify is None:
+                raise RuntimeError("origin approval route was closed")
+            if request_id is not None and not any(
+                entry.data.get("request_id") == request_id
+                for entry in _gateway_queues.get(self.session_key, [])
+            ):
+                raise RuntimeError("origin approval request was already settled")
+            _gateway_origin_dispatches[task] = self
+        try:
+            return await send()
+        finally:
+            with _lock:
+                _gateway_origin_dispatches.pop(task, None)
+
+
+_gateway_origin_route: ContextVar = ContextVar("gateway_approval_origin", default=None)
+_gateway_origin_routes: weakref.WeakSet = weakref.WeakSet()
+_gateway_origin_dispatches: dict = {}
+
+
+@contextmanager
+def gateway_approval_origin(session_key: str, notify):
+    """Pin the authentic turn's callback for async delegates, never a later turn's identity.
+
+    Copied contexts own its lifetime; session teardown explicitly revokes every copy. This
+    does not register a new approver or grant consent: the normal queue and timeout remain.
+    """
+    route = _GatewayOriginRoute(session_key, notify)
     with _lock:
-        _gateway_notify_cbs.pop(session_key, None)
+        _gateway_origin_routes.add(route)
+    token = _gateway_origin_route.set(route)
+    try:
+        yield
+    finally:
+        _gateway_origin_route.reset(token)
+
+
+def _revoke_gateway_origins(session_key: str | None) -> None:
+    """Caller holds _lock. None revokes all origins during gateway shutdown."""
+    if session_key is None:
+        _session_generations.clear()
+    else:
+        _session_generations.pop(session_key, None)
+    for route in list(_gateway_origin_routes):
+        if session_key is None or route.session_key == session_key:
+            route.notify = None
+    for task, route in list(_gateway_origin_dispatches.items()):
+        if session_key is None or route.session_key == session_key:
+            task.get_loop().call_soon_threadsafe(task.cancel)
+
+
+async def drain_gateway_origin_dispatches(timeout: float = 5.0) -> None:
+    """After shutdown revocation, drain cancelled adapter operations before disconnect."""
+    import asyncio
+    with _lock:
+        tasks = list(_gateway_origin_dispatches)
+    if tasks:
+        _, pending = await asyncio.wait(tasks, timeout=timeout)
+        if pending:
+            raise RuntimeError("approval sends did not drain before adapter teardown")
+
+
+def unregister_gateway_notify(session_key: str | None, *, preserve_origin: bool = False, expected_cb=None) -> None:
+    """Teardown revokes copied routes and wakes waits. Ordinary foreground completion can
+    preserve owned async routes; an older turn must never unregister a newer callback."""
+    with _consent_transaction(), _lock:
+        if session_key is None:
+            _gateway_notify_cbs.clear()
+            _revoke_gateway_origins(None)
+            for queue in _gateway_queues.values():
+                for entry in queue:
+                    entry.cancelled = "gateway_shutdown"
+                    entry.event.set()
+            _gateway_queues.clear()
+            return
+        if expected_cb is None or _gateway_notify_cbs.get(session_key) == expected_cb:
+            _gateway_notify_cbs.pop(session_key, None)
+        if preserve_origin:
+            return
+        _revoke_gateway_origins(session_key)
         for entry in _gateway_queues.pop(session_key, []):
             entry.event.set()
 
@@ -286,10 +409,11 @@ def clear_session(session_key: str) -> None:
     """Remove all approval and yolo state for a given session."""
     if not session_key:
         return
-    with _lock:
+    with _consent_transaction(), _lock:
         _session_approved.pop(session_key, None)
         _session_yolo.discard(session_key)
         _pending.pop(session_key, None)
+        _revoke_gateway_origins(session_key)
         for entry in _gateway_queues.pop(session_key, []):
             # Cancel blocked waits now so the old run unwinds instead of idling until timeout;
             # the prompt was withdrawn, nobody denied it.
@@ -352,6 +476,9 @@ def is_approved(session_key: str, pattern_key: str) -> bool:
     regex-derived key so existing command_allowlist entries survive key migrations."""
     aliases = _approval_key_aliases(pattern_key)
     with _lock:
+        origin = _gateway_origin_route.get()
+        if origin is not None and (origin.session_key != session_key or origin.notify is None):
+            return False
         approved = _permanent_set() | _session_approved.get(session_key, set())
     return any(alias in approved for alias in aliases)
 
@@ -463,18 +590,20 @@ def save_permanent_allowlist(patterns: set):
     """
     try:
         from hermes_cli.config import load_config, save_config
-        config = load_config()
-        on_disk = set(config.get("command_allowlist", []) or [])
-        with _lock:
-            key = _baseline_key()
-            baseline = _permanent_baseline_by_home.get(key, set())
-            merged = on_disk | (set(patterns) - baseline)
+        with _consent_transaction():
+            config = load_config()
+            on_disk = set(config.get("command_allowlist", []) or [])
+            with _lock:
+                key = _baseline_key()
+                baseline = _permanent_baseline_by_home.get(key, set())
+                merged = on_disk | (set(patterns) - baseline)
             config["command_allowlist"] = sorted(merged)
             save_config(config)
-            _permanent_baseline_by_home[key] = set(merged)
-            governing = _permanent_set()
-            governing.clear()
-            governing.update(merged)
+            with _lock:
+                _permanent_baseline_by_home[key] = set(merged)
+                governing = _permanent_set()
+                governing.clear()
+                governing.update(merged)
     except Exception as e:
         logger.warning("Could not save allowlist: %s", e)
 
@@ -539,6 +668,12 @@ def _user_approved(session_key: str, description: str) -> dict:
 
 
 def _gateway_notify_cb(session_key: str):
+    route = _gateway_origin_route.get()
+    if route is not None:
+        if route.session_key != session_key:
+            # Never borrow a different session's current notifier from a stale copied context.
+            raise RuntimeError("approval origin does not match the current session")
+        return route
     with _lock:
         return _gateway_notify_cbs.get(session_key)
 
@@ -805,6 +940,15 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
     """
     from agent.redact import redact_sensitive_text
 
+    # Snapshot before blocking reviewer/transport/CLI work. Legacy callers
+    # without copied origins need the same teardown protection after settlement.
+    origin = _gateway_origin_route.get()
+    with _lock:
+        generation = _session_generations.get(session_key)
+        if generation is None:
+            generation = _SessionGeneration()
+            _session_generations[session_key] = generation
+
     smart_denied = False
     if smart:
         result, smart_denied = _smart_gate(spec, command, description, pattern_key, pattern_keys,
@@ -825,12 +969,25 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
                        outcome=outcome, noun=spec.noun, **extra)
 
     def grant(choice: str) -> dict:
-        # A smart-DENY owner override is always one operation, even if an older client returns "session" or "always".
-        if not smart_denied:
-            _persist_choice(session_key, choice, warnings)
-        if spec.user_approved:
-            return _user_approved(session_key, description)
-        return _approved()
+        try:
+            # Teardown and this complete commit have a single order. No shared
+            # queue lock is held during persistence or transport operations.
+            with _consent_transaction():
+                with _lock:
+                    live = _session_generations.get(session_key) is generation and (
+                        origin is None or (origin.session_key == session_key and origin.notify is not None)
+                    )
+                if live:
+                    # A smart-DENY override remains one operation on all surfaces.
+                    if not smart_denied:
+                        _persist_choice(session_key, choice, warnings)
+                    if spec.user_approved:
+                        return _user_approved(session_key, description)
+                    return _approved()
+        except TimeoutError:
+            pass
+        return deny(spec.gateway_refused, "cancelled", reason="approval origin ended before consent committed",
+                    reason_addendum="", timeout_addendum="", deny_reason=None)
 
     if spec.transport:
         attempt = _present_with_selected_transport(

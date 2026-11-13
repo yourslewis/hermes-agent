@@ -17,7 +17,7 @@ async def learning_control(home, source, command):
         from agent.interview_questions import _directory_path
         with _directory_path(Path(home)) as directory:
             fd = os.open(config_path.name, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
-        with os.fdopen(fd, 'r+') as stream:
+        with os.fdopen(fd, 'r+', encoding='utf-8') as stream:
             if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
                 raise ValueError('Invalid configuration')
             fcntl.flock(stream, fcntl.LOCK_EX)

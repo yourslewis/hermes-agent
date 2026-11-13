@@ -993,6 +993,90 @@ def _extra_or_env_channel_set_getter(
     return getter
 
 
+# --- /model picker labels: enrich model names with context window + $/1M ---
+# Local metadata file (model_picker_meta.json, repo root) maps proxy aliases to
+# {in, out, ctx} from official vendor pricing pages. It lives next to the source
+# tree (not in any profile's config) so it survives profile resets; a gateway
+# restart picks up changes to it. Absent/corrupt file → labels fall back to the
+# bare model id (original behavior).
+import os as _os
+
+_MODEL_META_CACHE: dict = {"loaded": False, "models": {}}
+
+
+def _load_model_meta() -> dict:
+    if _MODEL_META_CACHE["loaded"]:
+        return _MODEL_META_CACHE["models"]
+    _MODEL_META_CACHE["models"] = {}
+    try:
+        root = _os.path.abspath(__file__)
+        for _ in range(4):  # adapter.py → slack/ → platforms/ → plugins/ → repo root
+            root = _os.path.dirname(root)
+        path = _os.path.join(root, "model_picker_meta.json")
+        if _os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as fh:
+                _MODEL_META_CACHE["models"] = (json.load(fh) or {}).get("models") or {}
+    except Exception:
+        _MODEL_META_CACHE["models"] = {}
+    _MODEL_META_CACHE["loaded"] = True
+    return _MODEL_META_CACHE["models"]
+
+
+def _fmt_ctx(n) -> str:
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return ""
+    if n >= 1_000_000:
+        v = n / 1_000_000
+        if v < 10:  # round to nearest whole M for small values (1.05M -> 1M)
+            v = round(v)
+            if v > 0:
+                return f"{int(v)}M"
+        return f"{int(v)}M" if v == int(v) else f"{v:.1f}M"
+    if n >= 1000:
+        v = n / 1000
+        if v == int(v):
+            return f"{int(v)}K"
+        v1024 = n / 1024
+        if v1024 == int(v1024):  # e.g. 131072 -> 128K
+            return f"{int(v1024)}K"
+        return f"{v:.0f}K"
+    return str(n)
+
+
+def _fmt_price(v) -> str:
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return ""
+    if v == int(v):
+        return f"${int(v)}"
+    if v < 1:
+        return f"${v:g}"
+    return f"${v:g}"
+
+
+def _model_picker_label(short: str) -> str:
+    """Model id + ' · 272K ctx · $0.10/$0.50 per 1M' (best-effort, ≤75 chars)."""
+    meta = _load_model_meta().get(short)
+    if not isinstance(meta, dict):
+        return short
+    parts = []
+    ctx = _fmt_ctx(meta.get("ctx"))
+    if ctx:
+        parts.append(f"{ctx} ctx")
+    pin, pout = _fmt_price(meta.get("in")), _fmt_price(meta.get("out"))
+    if pin and pout:
+        parts.append(f"{pin}/{pout} per 1M")
+    elif pin == "0" and pout == "0":
+        parts.append("self-hosted, free")
+    if not parts:
+        return short
+    label = f"{short} · {' · '.join(parts)}"
+    return label[:75]
+
+
 class SlackAdapter(BasePlatformAdapter):
     """Slack bot adapter (Socket Mode).
     Needs SLACK_BOT_TOKEN (xoxb-, API calls) and SLACK_APP_TOKEN (xapp-, Socket Mode). DMs +
@@ -1668,6 +1752,7 @@ class SlackAdapter(BasePlatformAdapter):
             await ack(response_type="ephemeral", text=f"Running `/{slash}`…")
             await self._handle_slash_command(command)
 
+        self._register_memory_review_actions()
         # Approval buttons, slash-confirm buttons (tools/slash_confirm.py), feedback.
         for _action_id in self._APPROVAL_CHOICES:
             self._app.action(_action_id)(self._handle_approval_action)
@@ -1802,6 +1887,7 @@ class SlackAdapter(BasePlatformAdapter):
                 self._start_socket_mode_handler()
                 self._running = True
                 self._ensure_socket_watchdog()
+                self._start_memory_review_delivery()
             except Exception:
                 self._running = False
                 try:
@@ -1818,6 +1904,44 @@ class SlackAdapter(BasePlatformAdapter):
         finally:
             if lock_acquired and not self._running:
                 self._release_platform_lock()
+
+    def _memory_review_service(self):
+        from tools.memory_review import MemoryReview, settings, enabled
+        if not enabled():
+            return None
+        # No _get_client fallback: an unknown workspace must fail closed.
+        client = self._team_clients.get(settings().get("team_id"))
+        return MemoryReview(client) if client is not None else None
+
+    def _register_memory_review_actions(self):
+        for action in ("approve", "reject", "defer"):
+            self._app.action("hermes_memory_" + action)(self._handle_memory_review_action)
+
+    async def _handle_memory_review_action(self, ack, body, **kwargs):
+        await ack()
+        service = self._memory_review_service()
+        if service is None:
+            return
+        try:
+            await service.callback(body)
+        except Exception:
+            # Never include proposal contents or callback payload in logs.
+            logger.warning("Private memory review callback refused or failed", exc_info=False)
+
+    def _start_memory_review_delivery(self):
+        from tools.memory_review import attach_delivery
+        service = self._memory_review_service()
+        if service is None:
+            return
+        attach_delivery(service, asyncio.get_running_loop())
+        async def recover_outbox():
+            while self._running:
+                try:
+                    await service.flush()
+                except Exception:
+                    logger.warning("Private memory review outbox failed; recover with /memory")
+                await asyncio.sleep(5)
+        self._memory_review_task = asyncio.create_task(recover_outbox())
 
     def _fatal_missing_env(self, env_name: str) -> None:
         """Log + record the permanent config error for a missing SLACK_* token."""
@@ -1874,6 +1998,15 @@ class SlackAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         """Disconnect from Slack."""
+        from tools.memory_review import detach_delivery
+        detach_delivery()
+        task = getattr(self, "_memory_review_task", None)
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
         self._running = False
         # Seal dangling native streams so no live-typing indicator survives a restart.
         for chat_id, stream in list(self._active_streams.items()):
@@ -4877,6 +5010,8 @@ class SlackAdapter(BasePlatformAdapter):
 
         return await self._send_interactive_prompt(chat_id, metadata, _build, "send_slash_confirm")
 
+
+
     def _build_model_picker_provider_blocks(
         self, providers: list, current_model: str, provider_label: str
     ) -> List[dict]:
@@ -4944,7 +5079,7 @@ class SlackAdapter(BasePlatformAdapter):
         for idx, model_id in enumerate(models):
             short = model_id.split("/")[-1] if "/" in model_id else model_id
             options.append({
-                "text": {"type": "plain_text", "text": short[:75], "emoji": True},
+                "text": {"type": "plain_text", "text": _model_picker_label(short)[:75], "emoji": True},
                 "value": str(idx),
             })
         total = (provider or {}).get("total_models", len(models))

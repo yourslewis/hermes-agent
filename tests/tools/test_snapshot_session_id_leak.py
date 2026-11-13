@@ -154,3 +154,27 @@ def test_snapshot_does_not_turn_later_commands_into_delegated_children(tmp_path)
         assert "[]" in parent["output"], f"parent command inherited the marker: {parent!r}"
     finally:
         env.cleanup()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX bash snapshot path")
+def test_export_dump_excludes_all_bridged_vars_but_keeps_user_exports(tmp_path):
+    import shlex
+    import subprocess
+
+    from gateway.session_context import _VAR_MAP
+
+    snapshot = tmp_path / "snapshot.sh"
+    child_env = {**os.environ, **dict.fromkeys(_VAR_MAP, "stale-session-value")}
+    child_env["HERMES_CRON_SESSION_DB_TIMEOUT"] = "17"
+    child_env["USER_SHELL_EXPORT"] = "keep-me"
+    result = subprocess.run(
+        ["bash", "-c", _export_dump_excluding_session_vars(shlex.quote(str(snapshot)))],
+        env=child_env, stdin=subprocess.DEVNULL, capture_output=True,
+        text=True, encoding="utf-8", timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    persisted = snapshot.read_text(encoding="utf-8")
+    for name in _VAR_MAP:
+        assert not re.search(rf"^declare -x {name}=", persisted, re.MULTILINE), name
+    assert 'HERMES_CRON_SESSION_DB_TIMEOUT="17"' in persisted
+    assert 'USER_SHELL_EXPORT="keep-me"' in persisted

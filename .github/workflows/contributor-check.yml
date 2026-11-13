@@ -23,12 +23,33 @@ jobs:
 
       - name: Check for unmapped contributor emails
         id: check-emails
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          CALLER_EVENT: ${{ github.event_name }}
         run: |
-          # Get the merge base between this PR and main
-          MERGE_BASE=$(git merge-base origin/main HEAD)
+          set -euo pipefail
+          # workflow_call inherits the caller's event (pull_request or push).
+          case "$CALLER_EVENT" in
+            pull_request)
+              # Use the event's immutable PR base; never fall back to main.
+              [[ "$PR_BASE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "Invalid or missing PR base SHA" >&2; exit 1; }
+              BASE=$(git rev-parse --verify --end-of-options "${PR_BASE_SHA}^{commit}")
+              # A valid but wrong commit (including HEAD) must not yield green.
+              [[ "$(git rev-parse HEAD^1)" == "$BASE" ]] || { echo "PR base does not match checkout" >&2; exit 1; }
+              git merge-base "$BASE" HEAD > /dev/null
+              ;;
+            push)
+              # Preserve the non-PR scan; main pushes normally have no new commits.
+              BASE=$(git merge-base origin/main HEAD)
+              ;;
+            *)
+              echo "Unsupported or missing caller event: $CALLER_EVENT" >&2
+              exit 1
+              ;;
+          esac
 
           # Find any new author emails in this PR's commits
-          NEW_EMAILS=$(git log ${MERGE_BASE}..HEAD --format='%ae' --no-merges | sort -u)
+          NEW_EMAILS=$(git log "${BASE}..HEAD" --format='%ae' --no-merges | sort -u)
 
           if [ -z "$NEW_EMAILS" ]; then
             echo "No new commits to check."
@@ -68,7 +89,7 @@ jobs:
             echo -e "$MISSING"
             echo ""
             echo "Add a mapping file (do NOT edit AUTHOR_MAP in release.py):"
-            echo "  python3 scripts/audit_pr_attribution.py --fix   # auto-resolve + create files"
+            echo "  python3 scripts/audit_pr_attribution.py --base-ref ${BASE} --fix   # auto-resolve + create files"
             echo "or manually:"
             echo -e "$MISSING" | while read -r line; do
               email=$(echo "$line" | sed 's/^ *//' | cut -d' ' -f1)
@@ -82,6 +103,7 @@ jobs:
             # Emit review_status for unmapped emails
             DETAIL=$(echo -e "$MISSING" | sed '/^$/d; s/^  //')
             HOW_TO_FIX=$'Run from the PR branch:\n```\npython3 scripts/audit_pr_attribution.py --fix\ngit add contributors && git commit -m "chore: map contributor emails" && git push\n```\nOr map one email manually (do NOT edit AUTHOR_MAP in release.py):\n```\npython3 scripts/add_contributor.py <email> <github-username>\n```\nTo find the GitHub username for an email:\n```\ngh api \'search/users?q=EMAIL+in:email\' --jq \'.items[0].login\'\n```\n'
+            HOW_TO_FIX=${HOW_TO_FIX/--fix/--base-ref ${BASE} --fix}
             REVIEW_STATUS=$(jq -nc \
               --arg detail "$DETAIL" \
               --arg how_to_fix "$HOW_TO_FIX" \

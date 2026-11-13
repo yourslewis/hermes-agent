@@ -1814,6 +1814,9 @@ class GatewayShutdownMixin:
         cancel_completion_batches = getattr(self, "_cancel_process_completion_batch_tasks", None)
         if cancel_completion_batches is not None:
             await cancel_completion_batches()
+        from tools.approval import unregister_gateway_notify, drain_gateway_origin_dispatches
+        unregister_gateway_notify(None)
+        await drain_gateway_origin_dispatches()
         for platform, adapter in list(self.adapters.items()):
             await self._bounded_adapter_teardown(adapter, platform)
         # Disconnect secondary-profile adapters (multiplex mode).
@@ -2024,6 +2027,9 @@ class GatewayShutdownMixin:
             await GatewayRunner._stop_drain_active_work(self, timeout, ctx)
             if ctx.timed_out:
                 await GatewayRunner._stop_interrupt_remaining_work(self, ctx)
+            from tools.approval import unregister_gateway_notify
+            # No retained child may send through adapters being disconnected (also on restart).
+            unregister_gateway_notify(None)
             await GatewayRunner._stop_finalize_agents_and_adapters(self, ctx)
             GatewayRunner._stop_release_runtime_state(self, ctx)
             GatewayRunner._stop_quiesce_and_close_session_dbs(self, timeout, ctx)

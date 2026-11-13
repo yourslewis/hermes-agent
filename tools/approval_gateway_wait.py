@@ -24,10 +24,11 @@ logger = logging.getLogger("tools.approval")
 
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
-    __slots__ = ("event", "data", "result", "reason", "acknowledged", "settle", "cancelled")
+    __slots__ = ("event", "data", "result", "reason", "acknowledged", "settle", "cancelled", "origin")
 
     def __init__(self, data: dict):
         self.event = threading.Event()
+        self.origin: object = None
         self.data = dict(data)
         self.data.setdefault("request_id", uuid.uuid4().hex)
         self.acknowledged = False
@@ -111,6 +112,12 @@ def _await_coalesced_leader(session_key: str, leader, payload: dict):
     state = _poll_event(leader.event, session_key,
                         interrupt_log="Coalesced approval wait interrupted — "
                                       "returning deny for session %s")
+    from tools import approval as _approval
+    with _approval._lock:
+        revoked = isinstance(leader.origin, _approval._GatewayOriginRoute) and leader.origin.notify is None
+        leader_choice, leader_reason = leader.result, leader.reason
+    if revoked:
+        return _finish(payload, False, None, None, cancelled="origin approval route was closed", coalesced=True)
     cancelled = _cancel_cause(state, leader)
     if state == "interrupted":
         # Deny only OUR follower; the leader thread handles its own signal.
@@ -118,13 +125,13 @@ def _await_coalesced_leader(session_key: str, leader, payload: dict):
     elif state == "timeout":
         choice, resolved = None, False
     else:
-        choice = leader.result
+        choice = leader_choice
         resolved = choice is not None
     if choice == "once":
         # The post hook fires for the fresh prompt's own lifecycle, not here.
         return None
     extra = {"cancelled": cancelled} if cancelled else {}
-    return _finish(payload, resolved, choice, getattr(leader, "reason", None), coalesced=True, **extra)
+    return _finish(payload, resolved, choice, leader_reason, coalesced=True, **extra)
 
 
 def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *, surface: str = "gateway") -> dict:
@@ -152,9 +159,13 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
         "session_key": session_key, "surface": surface,
     }
     keys = list(approval_data.get("pattern_keys") or [])
+    origin = notify_cb if isinstance(notify_cb, _approval._GatewayOriginRoute) else None
     with _approval._lock:
+        if origin is not None and origin.notify is None:
+            return {"resolved": False, "choice": None, "notify_failed": True}
         leader = next((e for e in _approval._gateway_queues.get(session_key, [])
                        if e.data.get("command") == approval_data.get("command")
+                       and e.origin is origin
                        and list(e.data.get("pattern_keys") or []) == keys), None)
     if leader is not None and not preparing_terminal_approval():
         adopted = _await_coalesced_leader(session_key, leader, payload)
@@ -162,7 +173,10 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
             return adopted
 
     entry = _ApprovalEntry(approval_data)
+    entry.origin = origin
     with _approval._lock:
+        if origin is not None and origin.notify is None:
+            return {"resolved": False, "choice": None, "notify_failed": True}
         register_prepared_approval(session_key, entry)
         _approval._gateway_queues.setdefault(session_key, []).append(entry)
 
@@ -174,6 +188,9 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
         nothing was pending instead of being acked "ok" while the agent denies)."""
         with _approval._lock:
             choice = entry.result
+            if origin is not None and origin.notify is None:
+                entry.cancelled = "origin approval route was closed"
+                choice = None
             queue = _approval._gateway_queues.get(session_key, [])
             if entry in queue:
                 queue.remove(entry)
@@ -214,6 +231,8 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
         entry.cancelled = cancelled
         entry.event.set()
     choice = _drop_entry(state)
+    if origin is not None and entry.cancelled:
+        cancelled = entry.cancelled
     if state == "interrupted":
         # Our own decision stays a fail-closed deny.
         choice = "deny"

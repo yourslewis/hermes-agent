@@ -29,6 +29,7 @@ Suppress an intentional use (e.g. tests or platform-gated code) with:
 from __future__ import annotations
 
 import argparse
+import ast
 import os
 import re
 import subprocess
@@ -591,6 +592,39 @@ def _looks_like_string_literal(line: str, match: "re.Match") -> bool:
     return in_s or in_d
 
 
+def _fdopen_text_lines(text: str) -> set[int] | None:
+    """Resolve outer-call arguments; retain regex fallback for invalid Python."""
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return None
+    # The regex matches any .fdopen(), not just literal os.fdopen(). Keep
+    # that conservative coverage for module aliases and unknown receivers.
+    # Also recognize explicitly imported aliases without tracing assignments.
+    fdopen_names = {"fdopen"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "os" and node.level == 0:
+            fdopen_names.update(alias.asname or alias.name for alias in node.names
+                                if alias.name == "fdopen")
+    lines = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (isinstance(func, ast.Name) and func.id in fdopen_names
+                or isinstance(func, ast.Attribute) and func.attr == "fdopen"):
+            continue
+        # As in the regex rule, **kwargs may supply encoding.
+        if any(kw.arg in ("encoding", None) for kw in node.keywords):
+            continue
+        mode = next((kw.value for kw in node.keywords if kw.arg == "mode"),
+                    node.args[1] if len(node.args) > 1 else None)
+        if isinstance(mode, ast.Constant) and isinstance(mode.value, str) and "b" in mode.value:
+            continue
+        lines.add(node.lineno)
+    return lines
+
+
 def scan_file(path: Path, footguns: list[Footgun]) -> list[tuple[int, str, Footgun]]:
     """Return a list of (line_number, line, footgun) for unsuppressed matches."""
     try:
@@ -598,6 +632,8 @@ def scan_file(path: Path, footguns: list[Footgun]) -> list[tuple[int, str, Footg
     except OSError:
         return []
     matches: list[tuple[int, str, Footgun]] = []
+    fdopen_lines = (_fdopen_text_lines(text)
+                    if any(fg.name.startswith("os.fdopen()") for fg in footguns) else None)
 
     # Track whether we're inside a triple-quoted string (docstring/raw block).
     # Simple state machine — handles both ''' and """, toggled by the FIRST
@@ -653,6 +689,10 @@ def scan_file(path: Path, footguns: list[Footgun]) -> list[tuple[int, str, Footg
             continue
         for fg in footguns:
             if fg.path_allowlist and any(s in str(path) for s in fg.path_allowlist):
+                continue
+            if fg.name.startswith("os.fdopen()") and fdopen_lines is not None:
+                if i in fdopen_lines:
+                    matches.append((i, line.rstrip(), fg))
                 continue
             match = fg.pattern.search(code)
             if not match:
